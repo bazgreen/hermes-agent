@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 
 from hermes_cli.version_info import (
     VersionInfo,
+    _derived_version,
     _reset_version_info_cache,
     format_display_version,
     get_version_info,
@@ -17,6 +18,13 @@ def test_format_display_version_omits_zero_distance():
     assert format_display_version(VersionInfo("0.20.0", "0.20.0+3", 3, None, None, "git")) == "0.20.0+3"
 
 
+def test_derived_version_shows_plus_question_for_dirty_unknown_distance():
+    assert _derived_version("0.19.0", None, dirty=True) == "0.19.0+?"
+    assert _derived_version("0.19.0", None, dirty=False) == "0.19.0"
+    assert _derived_version("0.19.0", 5, dirty=True) == "0.19.0+5"
+    assert _derived_version("0.19.0", 0, dirty=True) == "0.19.0"
+
+
 def test_get_version_info_uses_nix_revision_metadata(monkeypatch):
     monkeypatch.setenv("HERMES_REVISION", "a" * 40)
     monkeypatch.setenv("HERMES_REVISION_COUNT", "123")
@@ -28,7 +36,7 @@ def test_get_version_info_uses_nix_revision_metadata(monkeypatch):
     assert info == VersionInfo("0.19.0", "0.19.0+3", 3, "a" * 40, "feature/version", "nix")
 
 
-def test_get_version_info_keeps_nix_provenance_without_revision_counts(monkeypatch):
+def test_get_version_info_shows_plus_question_for_dirty_nix_without_counts(monkeypatch):
     monkeypatch.setenv("HERMES_REVISION", "a" * 40)
     monkeypatch.setenv("HERMES_REVISION_DIRTY", "1")
     monkeypatch.delenv("HERMES_REVISION_COUNT", raising=False)
@@ -36,7 +44,7 @@ def test_get_version_info_keeps_nix_provenance_without_revision_counts(monkeypat
 
     info = get_version_info()
 
-    assert info == VersionInfo("0.19.0", "0.19.0", None, "a" * 40, None, "nix", True)
+    assert info == VersionInfo("0.19.0", "0.19.0+?", None, "a" * 40, None, "nix", True)
 
 
 def test_get_version_info_counts_commits_after_semver_tag(tmp_path, monkeypatch):

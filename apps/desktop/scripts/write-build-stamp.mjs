@@ -173,7 +173,10 @@ export function deriveVersionMetadata(stamp, {
 
   const semver = releaseTag?.match(SEMVER_TAG)
   const taggedVersion = semver ? `${semver[1]}.${semver[2]}.${semver[3]}` : baseVersion
-  const displayVersion = distance !== null && distance > 0 ? `${taggedVersion}+${distance}` : taggedVersion
+  const displayVersion =
+    distance !== null && distance > 0 ? `${taggedVersion}+${distance}`
+    : stamp.dirty && distance === null ? `${taggedVersion}+?`
+    : taggedVersion
 
   return { ...stamp, baseVersion: taggedVersion, displayVersion, distance }
 }

@@ -138,3 +138,17 @@ test('deriveVersionMetadata accepts three-digit SemVer majors but rejects four-d
   assert.equal(stamp.displayVersion, '999.1.2+4')
   assert.equal(stamp.distance, 4)
 })
+
+test('deriveVersionMetadata shows +? for dirty builds with unknown distance', () => {
+  const stamp = deriveVersionMetadata(
+    { commit: 'a'.repeat(40), branch: 'feature', dirty: true, source: 'local' },
+    {
+      readFile: () => '__version__ = "0.19.0"\n__release_date__ = "2026.7.20"\n',
+      execFn: () => null
+    }
+  )
+
+  assert.equal(stamp.baseVersion, '0.19.0')
+  assert.equal(stamp.displayVersion, '0.19.0+?')
+  assert.equal(stamp.distance, null)
+})

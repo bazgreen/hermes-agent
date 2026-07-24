@@ -32,8 +32,12 @@ def format_display_version(info: VersionInfo | None = None) -> str:
     return info.derived_version
 
 
-def _derived_version(base_version: str, distance: int | None) -> str:
-    return f"{base_version}+{distance}" if distance and distance > 0 else base_version
+def _derived_version(base_version: str, distance: int | None, dirty: bool = False) -> str:
+    if distance and distance > 0:
+        return f"{base_version}+{distance}"
+    if dirty and distance is None:
+        return f"{base_version}+?"
+    return base_version
 
 
 def _run_git(repo_dir: Path, *args: str) -> str | None:
@@ -84,7 +88,7 @@ def _nix_version_info() -> VersionInfo | None:
     )
     return VersionInfo(
         __version__,
-        _derived_version(__version__, distance),
+        _derived_version(__version__, distance, os.environ.get("HERMES_REVISION_DIRTY") == "1"),
         distance,
         commit,
         os.environ.get("HERMES_REVISION_BRANCH") or None,
@@ -121,7 +125,7 @@ def _git_version_info(repo_dir: Path) -> VersionInfo:
             break
 
     return VersionInfo(
-        __version__, _derived_version(__version__, distance), distance, commit, branch, "git", dirty
+        __version__, _derived_version(__version__, distance, dirty), distance, commit, branch, "git", dirty
     )
 
 

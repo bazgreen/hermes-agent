@@ -208,9 +208,16 @@ stdenv.mkDerivation (finalAttrs: {
             # blank line, ending the makeWrapper command early and running
             # the next flag as its own shell command (`--suffix: command
             # not found`). Only reproduces when rev == null (dirty trees).
-            lib.optionalString (rev != null) " \\\n          --set HERMES_REVISION ${rev}" +
-            lib.optionalString (revCount != null && releaseRevCount != null) " \\\n          --set HERMES_REVISION_COUNT ${toString revCount} \\\n          --set HERMES_RELEASE_REV_COUNT ${toString releaseRevCount}" +
-            lib.optionalString (branch != null) " \\\n          --set HERMES_REVISION_BRANCH ${branch}" +
+            lib.optionalString (rev != null) " \\
+          --set HERMES_REVISION ${rev}" +
+            lib.optionalString (revCount != null && releaseRevCount != null) " \\
+          --set HERMES_REVISION_COUNT ${toString revCount} \\
+          --set HERMES_RELEASE_REV_COUNT ${toString releaseRevCount}" +
+            # Always set the branch: on a dirty tree flakes can't determine
+            # sourceInfo.ref, so fall back to "unknown" rather than letting
+            # the runtime pick up its self-update default ("main").
+            " \\
+          --set HERMES_REVISION_BRANCH ${if branch != null then branch else "unknown"}" +
             lib.optionalString dirty " \\\n          --set HERMES_REVISION_DIRTY 1"
           }${
             lib.optionalString (

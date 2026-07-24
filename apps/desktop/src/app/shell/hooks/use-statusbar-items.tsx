@@ -203,7 +203,8 @@ export function useStatusbarItems({
 
   const clientVersionItem = useMemo<StatusbarItem>(() => {
     const appVersion = desktopVersion?.appVersion
-    const sha = updateStatus?.currentSha?.slice(0, 7) ?? null
+    const sha = desktopVersion?.commit?.slice(0, 7) ?? updateStatus?.currentSha?.slice(0, 7) ?? null
+    const branch = desktopVersion?.branch ?? updateStatus?.branch ?? null
     const behind = updateStatus?.behind ?? 0
     const applying = updateApply.applying || updateApply.stage === 'restart'
     const remote = connection?.mode === 'remote'
@@ -218,10 +219,10 @@ export function useStatusbarItems({
 
     const tooltip = [
       applying ? updateApply.message || copy.updateInProgress : null,
-      !applying && behind > 0 && copy.commitsBehind(behind, updateStatus?.branch ?? '...'),
+      !applying && behind > 0 && copy.commitsBehind(behind, branch ?? '...'),
       appVersion && copy.desktopVersion(appVersion),
       sha && copy.commit(sha),
-      updateStatus?.branch && copy.branch(updateStatus.branch)
+      branch && copy.branch(branch)
     ]
       .filter(Boolean)
       .join(' · ')
@@ -239,6 +240,8 @@ export function useStatusbarItems({
     }
   }, [
     desktopVersion?.appVersion,
+    desktopVersion?.commit,
+    desktopVersion?.branch,
     connection?.mode,
     copy,
     updateApply.applying,

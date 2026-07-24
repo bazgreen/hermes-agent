@@ -14,10 +14,10 @@ import {
 import { ErrorIcon, ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { Progress } from '@/components/ui/progress'
+import { VersionDetails } from '@/components/version-details'
 import type { DesktopUpdateCommit, DesktopUpdateStage, DesktopUpdateStatus, DesktopVersionInfo } from '@/global'
 import { useI18n } from '@/i18n'
 import { buildCommitChangelog, type CommitGroup } from '@/lib/commit-changelog'
-import { ExternalLink } from '@/lib/external-link'
 import { AlertCircle, Check, Copy, Terminal } from '@/lib/icons'
 import { resolveUpdateCopy, type UpdateTarget } from '@/lib/update-copy'
 import { cn } from '@/lib/utils'
@@ -160,44 +160,6 @@ function ManagedInstallDetailsView({ onDone, version }: { onDone: () => void; ve
         {u.done}
       </Button>
     </div>
-  )
-}
-
-function VersionDetails({ version }: { version: DesktopVersionInfo }) {
-  const { t } = useI18n()
-  const u = t.updates
-
-  return (
-    <dl className="grid gap-2 rounded-lg border border-border/70 bg-muted/20 px-3 py-3 text-sm">
-      <div className="flex justify-between gap-4">
-        <dt className="text-muted-foreground">{u.versionDetailsVersion}</dt>
-        <dd>v{version.appVersion}</dd>
-      </div>
-      {version.baseVersion && (
-        <div className="flex justify-between gap-4">
-          <dt className="text-muted-foreground">{u.versionDetailsBaseVersion}</dt>
-          <dd>{version.baseVersion}</dd>
-        </div>
-      )}
-      {version.branch && (
-        <div className="flex justify-between gap-4">
-          <dt className="text-muted-foreground">{u.versionDetailsBranch}</dt>
-          <dd className="break-all text-right">{version.branch}</dd>
-        </div>
-      )}
-      {version.commit && (
-        <div className="grid gap-1">
-          <dt className="text-muted-foreground">{u.versionDetailsCommit}</dt>
-          <ExternalLink
-            className="break-all font-mono font-normal text-sm"
-            href={`https://github.com/NousResearch/hermes-agent/commit/${version.commit}`}
-          >
-            {version.commit}
-          </ExternalLink>
-        </div>
-      )}
-      {version.dirty && <div className="text-warning">{u.versionDetailsDirty}</div>}
-    </dl>
   )
 }
 
