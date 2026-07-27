@@ -3457,6 +3457,17 @@ def test_config_default_dispatch_in_gateway_is_true():
     )
 
 
+def test_config_default_verify_on_complete_is_false_and_overridable(tmp_path, monkeypatch):
+    """The verification gate is schema-backed, false by default, and file-configurable."""
+    from hermes_cli.config import DEFAULT_CONFIG, load_config
+
+    assert DEFAULT_CONFIG["kanban"]["verify_on_complete"] is False
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("kanban:\n  verify_on_complete: true\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert load_config()["kanban"]["verify_on_complete"] is True
+
+
 def test_check_dispatcher_presence_silent_when_gateway_running(monkeypatch):
     from hermes_cli import kanban as kb_cli
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)

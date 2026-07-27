@@ -2982,6 +2982,12 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Opt-in pre-completion verification gate. When enabled by a deployed
+        # verification hook, workers must pass the task body's literal
+        # ``## Verification`` commands before ``kanban_complete`` may close it.
+        # Keep disabled by default so existing Kanban installations retain their
+        # current completion behavior until they explicitly enable the gate.
+        "verify_on_complete": False,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.
