@@ -5743,3 +5743,211 @@ class TestCreateAgentModelRecovery:
         )
 
         assert captured["model"] == "session-row/model"
+# ---------------------------------------------------------------------------
+# /api/handoff capability policy — registry fail-closed regressions
+# ---------------------------------------------------------------------------
+
+
+class _HandoffFakeRequest:
+    """Minimal aiohttp.web.Request stand-in for /api/handoff handler tests."""
+
+    def __init__(self, headers=None, body=None):
+        self.method = "POST"
+        self.path = "/api/handoff"
+        self.path_qs = "/api/handoff"
+        self._headers = headers or {}
+        self._body = json.dumps(body or {}).encode()
+        self.transport = MagicMock()
+        self.transport.get_extra_info.return_value = ("127.0.0.1", 54321)
+        self.remote = "127.0.0.1"
+
+    @property
+    def headers(self):
+        return self._headers
+
+    async def json(self):
+        return json.loads(self._body.decode())
+
+    def __repr__(self):
+        return f"_HandoffFakeRequest({self.method} {self.path})"
+
+
+_HANDOFF_REGISTRY_YAML = """version: 1
+profiles:
+  mgmt:
+    description: Test callee profile.
+    capabilities:
+      - name: orchestration
+        aliases: [routing, triage]
+        risk: low
+        tools: [kanban, file]
+        routing:
+          requires_review: false
+        summon: true
+"""
+
+
+def _make_handoff_policy_adapter(monkeypatch):
+    """APIServerAdapter with a stubbed handoff config for policy tests."""
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    monkeypatch.setattr(
+        adapter,
+        "_handoff_config",
+        MagicMock(
+            return_value={
+                "secret": "test-handoff-secret",
+                "allowed_sources": ["code", "mgmt"],
+                "timeout": 30.0,
+            }
+        ),
+    )
+    return adapter
+
+
+def _handoff_request(body):
+    return _HandoffFakeRequest(
+        headers={"X-Handoff-Auth": "test-handoff-secret"},
+        body=body,
+    )
+
+
+class TestHandoffCapabilityRegistryFailClosed:
+    """Registry misconfiguration must fail closed (review_required), never 500
+    and never silently allow."""
+
+    def test_empty_registry_env_is_not_treated_as_current_directory(self, monkeypatch):
+        """Regression: an empty HERMES_CAPABILITY_REGISTRY must not resolve to '.'."""
+        from pathlib import Path
+
+        from hermes_cli import capability_registry as cr
+
+        monkeypatch.setenv("HERMES_CAPABILITY_REGISTRY", "")
+        candidates = cr._candidate_paths()
+        assert Path(".") not in candidates
+        assert all(str(candidate) not in ("", ".") for candidate in candidates)
+
+    def test_empty_string_explicit_path_does_not_resolve_to_cwd(self, monkeypatch):
+        """An empty explicit path must not load '.' as the registry."""
+        from hermes_cli import capability_registry as cr
+
+        with pytest.raises(cr.CapabilityRegistryError):
+            cr.load_capability_registry(path="")
+
+    def test_capability_alias_resolution(self, monkeypatch, tmp_path):
+        """Capability aliases resolve to their owning profile/capability."""
+        from hermes_cli import capability_registry as cr
+
+        registry_file = tmp_path / "capabilities.yaml"
+        registry_file.write_text(_HANDOFF_REGISTRY_YAML)
+        registry = cr.load_capability_registry(path=registry_file)
+
+        resolution = cr.resolve_capability("triage", registry=registry)
+        assert resolution.profile == "mgmt"
+        assert resolution.capability == "orchestration"
+
+    @pytest.mark.asyncio
+    async def test_directory_registry_path_fails_closed_without_500(self, monkeypatch, tmp_path):
+        """Regression: registry path resolving to a directory must fail closed
+        with 409 review_required — never a 500, never tool execution."""
+        monkeypatch.setenv("HERMES_CAPABILITY_REGISTRY", str(tmp_path))
+        adapter = _make_handoff_policy_adapter(monkeypatch)
+        run_tool = MagicMock()
+        adapter._run_handoff_tool = run_tool
+
+        response: web.Response = await adapter._handle_handoff(
+            _handoff_request(
+                {
+                    "from": "code",
+                    "target_profile": "mgmt",
+                    "action": "tool_call",
+                    "tool": "kanban",
+                    "params": {},
+                }
+            )
+        )
+
+        assert response.status == 409
+        payload = json.loads(response.body)
+        assert payload["policy"]["decision"] == "review_required"
+        run_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_malformed_registry_file_fails_closed_without_500(self, monkeypatch, tmp_path):
+        """A malformed registry file must fail closed with 409 review_required."""
+        bad = tmp_path / "capabilities.yaml"
+        bad.write_text("profiles: [not, a, mapping\n")
+        monkeypatch.setenv("HERMES_CAPABILITY_REGISTRY", str(bad))
+        adapter = _make_handoff_policy_adapter(monkeypatch)
+        run_tool = MagicMock()
+        adapter._run_handoff_tool = run_tool
+
+        response: web.Response = await adapter._handle_handoff(
+            _handoff_request(
+                {
+                    "from": "code",
+                    "target_profile": "mgmt",
+                    "action": "tool_call",
+                    "tool": "kanban",
+                    "params": {},
+                }
+            )
+        )
+
+        assert response.status == 409
+        payload = json.loads(response.body)
+        assert payload["policy"]["decision"] == "review_required"
+        run_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_callee_profile_and_profile_aliases_resolve(self, monkeypatch, tmp_path):
+        """callee_profile / profile body fields are accepted aliases for target_profile."""
+        registry_file = tmp_path / "capabilities.yaml"
+        registry_file.write_text(_HANDOFF_REGISTRY_YAML)
+        monkeypatch.setenv("HERMES_CAPABILITY_REGISTRY", str(registry_file))
+
+        for alias_field in ("target_profile", "callee_profile", "profile"):
+            adapter = _make_handoff_policy_adapter(monkeypatch)
+
+            async def fake_run(tool_name, params, *, timeout=30.0):
+                return {"result": {"tool": tool_name}}
+
+            adapter._run_handoff_tool = fake_run
+            response: web.Response = await adapter._handle_handoff(
+                _handoff_request(
+                    {
+                        "from": "code",
+                        alias_field: "mgmt",
+                        "action": "tool_call",
+                        "tool": "kanban",
+                        "params": {},
+                    }
+                )
+            )
+            assert response.status == 200, f"{alias_field} alias was not honoured: {response.body}"
+
+    @pytest.mark.asyncio
+    async def test_undeclared_tool_is_denied(self, monkeypatch, tmp_path):
+        """A tool the callee does not advertise is denied (403), not executed."""
+        registry_file = tmp_path / "capabilities.yaml"
+        registry_file.write_text(_HANDOFF_REGISTRY_YAML)
+        monkeypatch.setenv("HERMES_CAPABILITY_REGISTRY", str(registry_file))
+        adapter = _make_handoff_policy_adapter(monkeypatch)
+        run_tool = MagicMock()
+        adapter._run_handoff_tool = run_tool
+
+        response: web.Response = await adapter._handle_handoff(
+            _handoff_request(
+                {
+                    "from": "code",
+                    "target_profile": "mgmt",
+                    "action": "tool_call",
+                    "tool": "terminal",
+                    "params": {"command": "echo no"},
+                }
+            )
+        )
+
+        assert response.status == 403
+        payload = json.loads(response.body)
+        assert payload["policy"]["decision"] == "deny"
+        run_tool.assert_not_called()

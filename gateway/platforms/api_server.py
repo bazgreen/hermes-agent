@@ -55,7 +55,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -90,6 +90,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from hermes_cli.capability_registry import CapabilityRegistryError, describe_profile_capabilities, load_capability_registry
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
@@ -1759,6 +1760,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
+            ("POST", "/api/handoff", self._handle_handoff),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
@@ -2689,6 +2691,503 @@ class APIServerAdapter(BasePlatformAdapter):
             "updated_at": normalize_updated_at(runtime.get("updated_at")),
             "pid": os.getpid(),
         })
+
+    async def _handle_handoff(self, request: "web.Request") -> "web.Response":
+        """POST /api/handoff — bot-to-bot handoff endpoint.
+
+        Receives structured requests from other Hermes gateways and executes
+        a tool on this gateway's behalf.
+
+        Auth:
+            1. X-Handoff-Auth header must match the configured shared secret.
+            2. ``from`` field must be in the profile's ``handoff.allowed_sources``
+               list (or the global ``handoff.allowed_sources`` in config.yaml).
+            3. If ``allowed_sources`` is passed in the request body, it is used
+               instead of the server config (caller-driven restriction).
+
+        Request body::
+
+            {
+                "from": "code",
+                "action": "tool_call",
+                "tool": "terminal",
+                "params": {"command": "date"},
+                "allowed_sources": ["code", "mgmt"]  # optional, overrides server config
+            }
+
+        Response (200)::
+
+            {"result": {<tool output dict>}}
+
+        Error responses:
+            401 — Invalid or missing X-Handoff-Auth
+            403 — Source not in allowed_sources
+            404 — Tool not found
+            504 — Tool execution timed out
+        """
+        from hermes_tools.handoff import HandoffError as _HE
+
+        # --- Auth step 1: shared secret ---
+        secret_cfg = self._handoff_config()
+        handoff_secret = secret_cfg.get("secret", "")
+        if not handoff_secret:
+            logger.warning(
+                "Handoff request received but no handoff.secret configured. "
+                "Add handoff: {secret: ...} to config.yaml"
+            )
+            return web.json_response(
+                {"error": "Handoff not configured on this gateway"},
+                status=501,
+            )
+
+        auth_header = request.headers.get("X-Handoff-Auth", "")
+        req_from = "unknown"
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        req_from = body.get("from", "unknown")
+        if not hmac.compare_digest(auth_header, handoff_secret):
+            logger.warning(
+                "Handoff auth rejected for from=%s: %s",
+                req_from,
+                self._request_audit_log_suffix(request),
+            )
+            return web.json_response({"error": "Invalid handoff auth"}, status=401)
+
+        # --- Auth step 2: source allowlisting ---
+        # SECURITY (card t_d0e3307d, 2026-07-13): the allowlist is taken ONLY
+        # from this gateway's own config. Previously a caller-supplied
+        # ``allowed_sources`` in the request body overrode server config, so any
+        # authenticated caller could whitelist itself (send allowed_sources=
+        # [its own name]) and defeat the gate entirely. The body value is now
+        # ignored for enforcement (it is still recorded in the audit trail as
+        # the caller's *requested* sources).
+        from_bot = body.get("from", "")
+        requested_sources = body.get("allowed_sources") or []
+        allowed = secret_cfg.get("allowed_sources", [])
+        if allowed and from_bot not in allowed:
+            logger.warning(
+                "Handoff source %r not in allowed_sources=%s",
+                from_bot,
+                allowed,
+            )
+            return web.json_response(
+                {"error": f"Source {from_bot!r} not allowed"},
+                status=403,
+            )
+
+        # --- Validate action and apply capability policy ---
+        action = body.get("action", "")
+        if action not in {"tool_call", "summon"}:
+            return web.json_response(
+                {"error": f"Unsupported action {action!r}; only 'tool_call' and 'summon' are supported"},
+                status=400,
+            )
+
+        target_profile = self._handoff_target_profile(body)
+        policy = self._handoff_policy_decision(action, body.get("tool", ""), target_profile)
+        if policy["decision"] != "allow":
+            from tools.delegation_audit import record_delegation_audit
+
+            context_pack = body.get("context_pack") if isinstance(body.get("context_pack"), Mapping) else {}
+            record_delegation_audit(
+                action=policy["decision"],
+                caller_profile=str(from_bot or ""),
+                callee_profile=target_profile,
+                parameters={
+                    "action": action,
+                    "tool": body.get("tool", ""),
+                    "params": body.get("params", {}),
+                    "query": body.get("query", ""),
+                    "allowed_sources": allowed or [],
+                    "requested_sources": requested_sources,
+                },
+                correlation_id=str((context_pack or {}).get("correlation_id") or ""),
+                task_id=str((context_pack or {}).get("task_id") or ""),
+                session_id=str((context_pack or {}).get("session_id") or ""),
+                reason=policy["reason"],
+                source="handoff_request",
+            )
+            status = 409 if policy["decision"] == "review_required" else 403
+            return web.json_response(
+                {
+                    "error": policy["reason"],
+                    "policy": {
+                        "decision": policy["decision"],
+                        "target_profile": target_profile,
+                    },
+                },
+                status=status,
+            )
+
+        if action == "tool_call":
+            tool_name = body.get("tool", "")
+            params = body.get("params", {})
+            if not tool_name:
+                return web.json_response({"error": "Missing 'tool' field"}, status=400)
+
+            # --- Resolve and execute tool ---
+            timeout = secret_cfg.get("timeout", 30.0)
+            try:
+                result = await self._run_handoff_tool(tool_name, params, timeout=timeout)
+                if isinstance(result, web.Response):
+                    return result  # already a web.Response
+                return web.json_response({"result": result})
+            except _HE as exc:
+                status = exc.status if exc.status and exc.status >= 400 else 500
+                return web.json_response({"error": exc.detail}, status=status)
+            except Exception as exc:
+                logger.exception("Handoff tool %r failed", tool_name)
+                return web.json_response(
+                    {"error": f"Handoff tool execution failed: {exc}"},
+                    status=500,
+                )
+
+        query = body.get("query", "")
+        if not isinstance(query, str) or not query.strip():
+            return web.json_response({"error": "Missing 'query' field"}, status=400)
+        context_pack = body.get("context_pack")
+
+        timeout = secret_cfg.get("summon_timeout", 60.0)
+        try:
+            summon_kwargs = {"query": query, "timeout": timeout}
+            if context_pack is not None:
+                summon_kwargs["context_pack"] = context_pack
+            result = await self._run_handoff_summon(**summon_kwargs)
+            return web.json_response(result)
+        except _HE as exc:
+            status = exc.status if exc.status and exc.status >= 400 else 500
+            return web.json_response({"error": exc.detail}, status=status)
+        except Exception as exc:
+            logger.exception("Handoff summon failed")
+            return web.json_response(
+                {"error": f"Handoff summon execution failed: {exc}"},
+                status=500,
+            )
+
+    def _handoff_target_profile(self, request_body: Mapping[str, Any]) -> str:
+        """Return the callee profile used for capability policy lookup."""
+        target = (
+            str(request_body.get("target_profile") or "").strip()
+            or str(request_body.get("callee_profile") or "").strip()
+            or str(request_body.get("profile") or "").strip()
+        )
+        if target:
+            return target.lower()
+        for env_name in ("HERMES_PROFILE", "HERMES_SESSION_USER_NAME", "HERMES_SESSION_PLATFORM"):
+            value = str(os.environ.get(env_name) or "").strip()
+            if value:
+                return value.lower()
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = get_hermes_home()
+            if hermes_home and hermes_home.name and hermes_home.name != ".hermes":
+                return hermes_home.name.lower()
+        except Exception:
+            pass
+        return "default"
+
+    def _handoff_policy_decision(self, action: str, tool_name: str, target_profile: str) -> dict[str, Any]:
+        """Map capability metadata to allow, deny, or review_required."""
+        normalized_action = (action or "").strip().lower()
+        normalized_tool = (tool_name or "").strip().lower()
+        profile = (target_profile or "default").strip().lower() or "default"
+        if normalized_action not in {"tool_call", "summon"}:
+            return {
+                "decision": "deny",
+                "reason": f"Unsupported action {action!r}; only 'tool_call' and 'summon' are supported",
+            }
+
+        if normalized_action == "tool_call" and normalized_tool == "echo":
+            return {
+                "decision": "allow",
+                "reason": "legacy synthetic echo tool bypasses capability gating",
+            }
+
+        registry = getattr(self, "_capability_registry", None)
+        if registry is None:
+            try:
+                registry = load_capability_registry()
+                self._capability_registry = registry
+            except CapabilityRegistryError as exc:
+                # SECURITY (card t_d0e3307d, 2026-07-13): FAIL CLOSED. This
+                # previously returned "allow" when the registry could not load,
+                # which meant a remote tool_call (e.g. the `terminal` tool =
+                # arbitrary command execution) was gated by the shared secret
+                # ALONE whenever the registry file was missing/corrupt. If we
+                # cannot evaluate capability policy we must not auto-execute:
+                # route to human review instead of allowing.
+                logger.warning(
+                    "Capability registry unavailable for handoff policy; "
+                    "failing closed (review_required): %s", exc
+                )
+                return {
+                    "decision": "review_required",
+                    "reason": f"Capability registry unavailable; cannot verify policy, routing to review ({exc})",
+                }
+
+        try:
+            records = describe_profile_capabilities(profile, registry=registry)
+        except CapabilityRegistryError as exc:
+            return {
+                "decision": "deny",
+                "reason": f"Unknown target profile {profile!r} in capability registry: {exc}",
+            }
+
+        if normalized_action == "summon":
+            summonable = [record for record in records if bool(record.summon)]
+            if not summonable:
+                return {
+                    "decision": "deny",
+                    "reason": f"Profile {profile!r} does not advertise summon capability",
+                }
+            return {
+                "decision": "allow",
+                "reason": f"Profile {profile!r} allows summon via {', '.join(record.display_name for record in summonable)}",
+            }
+
+        matching = [record for record in records if normalized_tool and normalized_tool in record.tools]
+        if not matching:
+            avoiders = [
+                record.display_name
+                for record in records
+                if normalized_tool and normalized_tool in {str(item).strip().lower() for item in (record.routing.get("avoid") or [])}
+            ]
+            if avoiders:
+                return {
+                    "decision": "deny",
+                    "reason": f"Tool {normalized_tool!r} is explicitly avoided by {', '.join(avoiders)}",
+                }
+            return {
+                "decision": "deny",
+                "reason": f"Tool {normalized_tool!r} is not declared by profile {profile!r}",
+            }
+
+        if any(str(record.risk).strip().lower() == "high" or bool(record.routing.get("requires_review")) for record in matching):
+            return {
+                "decision": "review_required",
+                "reason": f"Tool {normalized_tool!r} is high-risk for profile {profile!r} via {', '.join(record.display_name for record in matching)}",
+            }
+
+        return {
+            "decision": "allow",
+            "reason": f"Tool {normalized_tool!r} is allowed by profile {profile!r} via {', '.join(record.display_name for record in matching)}",
+        }
+
+    def _handoff_config(self) -> dict:
+        """Return the handoff config block from the active YAML profile config.
+
+        Reads ``handoff: {secret: ..., allowed_sources: [...], timeout: ...}``
+        from the profile's config.yaml, with ``~/.hermes/config.yaml`` as the
+        primary source and a fallback to env vars.
+
+        Returns a dict (possibly empty). Callers must handle a missing 'secret'.
+        """
+        import yaml as _yaml
+        from pathlib import Path as _Path
+
+        cfg: dict = {}
+        try:
+            from hermes_cli.config import get_hermes_home
+            profile_cfg = _Path(get_hermes_home()) / "config.yaml"
+            if profile_cfg.exists():
+                with open(profile_cfg, encoding="utf-8") as f:
+                    loaded = _yaml.safe_load(f) or {}
+                    cfg = loaded.get("handoff", {})
+        except Exception:
+            pass
+
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        # Merge in env var overrides
+        env_secret = os.environ.get("HERMES_HANDOFF_SECRET")
+        if env_secret:
+            cfg["secret"] = env_secret
+        env_timeout = os.environ.get("HERMES_HANDOFF_TIMEOUT")
+        if env_timeout:
+            try:
+                cfg["timeout"] = float(env_timeout)
+            except (TypeError, ValueError):
+                pass
+
+        return cfg
+
+    async def _run_handoff_tool(
+        self,
+        tool_name: str,
+        params: dict,
+        *,
+        timeout: float = 30.0,
+    ) -> dict:
+        """Resolve and execute a named tool from the gateway's process env.
+
+        This imports and calls the raw tool function directly
+        (not through AIAgent, which is too heavy for a handoff).
+
+        Tool modules are expected under ``tools.<tool_name>_tool`` (the
+        naming convention used by Hermes built-in tools: ``terminal_tool``,
+        ``read_file`` as ``tools/terminal_tool.py``, etc.).
+
+        Returns the raw result dict on success.
+
+        Raises:
+            HandoffError from hermes_tools.handoff on lookup/execution failure.
+        """
+        from hermes_tools.handoff import HandoffError as _HE
+        import importlib as _il
+
+        # Map tool names to their module paths
+        # Built-in Hermes tools live in tools/<name>_tool.py
+        # and are exposed as functions named <name>_tool()
+        TOOL_MODULE_MAP = {
+            "terminal": ("tools.terminal_tool", "terminal_tool"),
+            "read_file": ("tools.file_tools", "read_file_tool"),
+            "write_file": ("tools.file_tools", "write_file_tool"),
+            "echo": (None, None),  # special: synthetic tool
+            "search_files": ("tools.file_tools", "search_tool"),
+            "web_search": ("tools.web_tools", "web_search_tool"),
+            "web_extract": ("tools.web_tools", "web_extract_tool"),
+            "memory": ("tools.memory_tool", "memory_tool"),
+            "todo": ("tools.todo_tool", "todo_tool"),
+        }
+
+        # --- Special tools ---
+        if tool_name == "echo":
+            return {"echoed": params.get("text", "")}
+
+        # --- Look up tool ---
+        entry = TOOL_MODULE_MAP.get(tool_name)
+        if entry is None:
+            raise _HE(
+                "tool_not_found",
+                f"Tool {tool_name!r} not found in handoff registry",
+                status=404,
+            )
+
+        mod_path, func_name = entry
+        try:
+            mod = _il.import_module(mod_path)
+        except (ImportError, ModuleNotFoundError):
+            raise _HE(
+                "tool_not_found",
+                f"Tool module {mod_path!r} could not be loaded",
+                status=404,
+            )
+
+        func = getattr(mod, func_name, None)
+        if func is None:
+            raise _HE(
+                "tool_not_found",
+                f"Function {func_name!r} not found in module {mod_path!r}",
+                status=404,
+            )
+
+        # --- Execute with timeout ---
+        try:
+            if asyncio.iscoroutinefunction(func):
+                result = await asyncio.wait_for(func(**params), timeout=timeout)
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(func, **params),
+                    timeout=timeout,
+                )
+        except asyncio.TimeoutError:
+            raise _HE(
+                "timeout",
+                f"Tool {tool_name!r} timed out after {timeout}s",
+                status=504,
+            )
+        except Exception as exc:
+            raise _HE(
+                "server_error",
+                f"Tool {tool_name!r} execution failed: {exc}",
+                status=500,
+            )
+
+        return {"result": result}
+
+    async def _run_handoff_summon(
+        self,
+        query: str,
+        *,
+        timeout: float = 60.0,
+        context_pack: dict | None = None,
+    ) -> dict:
+        """Run a fresh agent turn for a bot-to-bot summon request.
+
+        The summon path is intentionally lighter-weight than the regular
+        gateway chat endpoints: it starts a brand-new turn with no prior
+        conversation history, lets the agent reason with its normal toolset,
+        and returns plaintext plus light usage metrics.
+        """
+        started_at = time.time()
+        from hermes_tools.handoff import HandoffError as _HE
+
+        prompt = query
+        if isinstance(context_pack, dict) and context_pack:
+            try:
+                from hermes_tools.cowork_context_pack import render_context_pack_markdown
+
+                context_md = render_context_pack_markdown(context_pack).strip()
+            except ImportError:
+                # cowork_context_pack is an optional cowork feature, not part of
+                # the handoff/capability-policy scope. Fall back to a plain JSON
+                # rendering so a summon carrying a context pack still works when
+                # that module is not installed.
+                import json as _json
+
+                context_md = _json.dumps(context_pack, indent=2, default=str)
+            prompt = (
+                "Structured cowork context pack:\n\n"
+                f"{context_md}\n\n"
+                "---\n\n"
+                f"{query.strip()}"
+            )
+
+        try:
+            result, usage = await asyncio.wait_for(
+                self._run_agent(
+                    user_message=prompt,
+                    conversation_history=[],
+                    session_id=f"handoff_summon_{uuid.uuid4().hex}",
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise _HE(
+                f"Summon request timed out after {timeout}s",
+                status=504,
+            )
+
+        if not isinstance(result, dict):
+            raise _HE(
+                f"Summon request returned invalid result: {type(result).__name__}",
+                status=500,
+            )
+
+        if result.get("failed"):
+            error_msg = result.get("error") or "summon request failed"
+            raise _HE(str(error_msg), status=500)
+
+        final_response = result.get("final_response")
+        if final_response is None:
+            error_msg = result.get("error") or "summon request produced no answer"
+            raise _HE(str(error_msg), status=500)
+
+        metrics = dict(usage or {})
+        metrics.setdefault("api_calls", result.get("api_calls", 0))
+        metrics.setdefault("completed", bool(result.get("completed")))
+        metrics["elapsed_ms"] = round((time.time() - started_at) * 1000, 1)
+
+        return {
+            "success": True,
+            "result": str(final_response),
+            "metrics": metrics,
+        }
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — list hermes-agent and any configured model_routes aliases.
