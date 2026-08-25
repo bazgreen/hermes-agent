@@ -222,6 +222,7 @@ class TestSafeCommand:
 def _clear_session(key):
     """Replace for removed clear_session() — directly clear internal state."""
     approval_module._session_approved.pop(key, None)
+    approval_module._session_trusted.discard(key)
     approval_module._pending.pop(key, None)
 
 
@@ -233,6 +234,69 @@ class TestApproveAndCheckSession:
         assert is_approved(key, "rm") is False
         approve_session(key, "rm")
         assert is_approved(key, "rm") is True
+
+
+class TestGatewayAlwaysTrustsWorkflow:
+    """Gateway/manual 'always' should trust the active workflow session.
+
+    This prevents repeated approval prompts for later low-risk commands in the
+    same slash-command/orchestration run while keeping the hardline blocklist
+    in force.
+    """
+
+    def test_always_approval_trusts_followup_different_pattern(self, monkeypatch):
+        from tools import approval as mod
+
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        mod._session_approved.clear()
+        mod._session_trusted.clear()
+        mod._permanent_approved.clear()
+        mod._pending.clear()
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "trusted-workflow")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.setattr(
+            mod,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "gateway_timeout": 5, "timeout": 5},
+        )
+
+        notified = []
+        mod.register_gateway_notify(
+            "trusted-workflow",
+            lambda data: notified.append((data["command"], data["pattern_key"])),
+        )
+
+        first_result = {}
+
+        def _run_first():
+            first_result["value"] = mod.check_all_command_guards("chmod 777 ./tmpfile", "local")
+
+        t = threading.Thread(target=_run_first)
+        t.start()
+        for _ in range(200):
+            if notified:
+                break
+            time.sleep(0.01)
+
+        assert notified == [("chmod 777 ./tmpfile", "world/other-writable permissions")]
+        with mock_patch("tools.approval.record_delegation_audit") as mock_audit:
+            mod.resolve_gateway_approval("trusted-workflow", "always")
+        t.join(timeout=5)
+        assert "value" in first_result
+        assert first_result["value"]["approved"] is True
+        mock_audit.assert_called_once()
+        audit_kwargs = mock_audit.call_args.kwargs
+        assert audit_kwargs["action"] == "allow"
+        assert audit_kwargs["source"] == "approval_gateway"
+
+        before = len(notified)
+        second_result = mod.check_all_command_guards("git push --force origin main", "local")
+        assert second_result["approved"] is True
+        assert len(notified) == before
 
 
 class TestSessionKeyContext:
@@ -1130,21 +1194,17 @@ class TestApprovalTimeoutIsNotConsent:
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
         mod._session_approved.clear()
+        mod._session_trusted.clear()
         mod._permanent_approved.clear()
         mod._pending.clear()
 
         self._saved_env = {
             k: os.environ.get(k)
-            for k in ("HERMES_GATEWAY_SESSION", "HERMES_CRON_SESSION",
-                      "HERMES_YOLO_MODE",
+            for k in ("HERMES_GATEWAY_SESSION", "HERMES_YOLO_MODE",
                       "HERMES_SESSION_KEY", "HERMES_INTERACTIVE")
         }
         os.environ.pop("HERMES_YOLO_MODE", None)
         os.environ.pop("HERMES_INTERACTIVE", None)
-        # HERMES_CRON_SESSION takes priority over HERMES_GATEWAY_SESSION in
-        # _is_gateway_approval_context(); a leaked value from a parent cron
-        # process would force the cron path and break these gateway tests.
-        os.environ.pop("HERMES_CRON_SESSION", None)
         os.environ["HERMES_GATEWAY_SESSION"] = "1"
         os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
 
@@ -1152,6 +1212,10 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod._session_approved.clear()
+        mod._session_trusted.clear()
+        mod._permanent_approved.clear()
+        mod._pending.clear()
         for k, v in self._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)

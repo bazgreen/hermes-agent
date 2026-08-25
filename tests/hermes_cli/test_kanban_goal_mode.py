@@ -145,7 +145,8 @@ class TestCLIJudgeGate:
     """
 
     def _run(self, monkeypatch, *, goal_mode=True, judge_available=True,
-             verdict="done", reason="", complete_ok=True, summary="done"):
+             verdict="done", reason="", complete_ok=True, summary="done",
+             parse_failed=False, transport_failed=False):
         import argparse
         import types
         from unittest.mock import MagicMock
@@ -184,7 +185,7 @@ class TestCLIJudgeGate:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
         monkeypatch.setattr(
             "hermes_cli.goals.judge_goal",
-            lambda **kw: (verdict, reason, False, None, False),
+            lambda **kw: (verdict, reason, parse_failed, None, transport_failed),
         )
 
         args = argparse.Namespace(task_ids=["t1"], summary=summary, result=None, metadata=None)
@@ -205,3 +206,32 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+    def test_transport_failure_fails_open(self, monkeypatch, caplog):
+        """A judge transport failure (transport_failed=True) must NOT reject
+        completion — the gate fails open with a warning instead of wedging the
+        worker (regression for PermissionDeniedError / HTTP 403)."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban"):
+            rc, complete_calls = self._run(
+                monkeypatch, verdict="continue", reason="judge error: PermissionDeniedError",
+                transport_failed=True,
+            )
+        assert rc == 0
+        assert complete_calls == ["t1"]
+        assert any(
+            "transport failed" in rec.message for rec in caplog.records
+        ), f"expected a transport-failure warning, got: {[r.message for r in caplog.records]}"
+
+    def test_parse_failure_still_rejected(self, monkeypatch):
+        """parse_failed=True with transport_failed=False is not a transport
+        failure: the non-done verdict must still reject completion. Only
+        transport_failed=True is allowed to fail open."""
+        rc, complete_calls = self._run(
+            monkeypatch, verdict="continue", reason="judge error: mock",
+            parse_failed=True, transport_failed=False,
+        )
+        assert rc != 0, "parse failure must not fail open"
+        assert complete_calls == [], (
+            "complete_task must NOT be invoked on a parse-failure rejection"
+        )

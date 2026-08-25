@@ -219,6 +219,58 @@ class TestContainerSystemdSupport:
 
 
 
+def test_fleet_status_uses_task_summary(monkeypatch, capsys):
+    import json
+    import urllib.request
+
+    monkeypatch.setattr(gateway, "_FLEET_STATUS_PROFILES", ("code",))
+    monkeypatch.setattr(gateway, "_FLEET_STATUS_PORTS", {"code": 8654})
+    monkeypatch.setattr(gateway, "_FLEET_STATUS_LABELS", {"code": "Code"})
+
+    payload = {
+        "profile": "code",
+        "provider_ok": True,
+        "gateway_state": "running",
+        "model": "anthropic/claude-sonnet-4",
+        "pid": 1234,
+        "memory_used_chars": 204,
+        "memory_limit_chars": 819,
+        "toolsets": ["terminal", "web"],
+        "task_summary": {
+            "id": "t_123",
+            "status": "running",
+            "title": "Ship task summary support",
+        },
+    }
+
+    class FakeResponse:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return self._body
+
+    def fake_urlopen(req, timeout=0):
+        assert req.full_url == "http://127.0.0.1:8654/api/status"
+        return FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    gateway._print_other_profiles_gateway_status()
+
+    out = capsys.readouterr().out
+    assert "Fleet status:" in out
+    assert 'task=t_123 running "Ship task summary support"' in out
+    assert "mem 204/819" in out
+    assert "pid 1234" in out
+
+
 def test_systemd_install_checks_linger_status(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "systemd" / "user" / "hermes-gateway.service"
 

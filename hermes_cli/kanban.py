@@ -94,11 +94,15 @@ def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
     return {"state_type": st, "state_name": sn}
 
 
-def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
+def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Parse ``--workspace`` into ``(kind, path|None)``.
 
     Accepts: ``scratch``, ``worktree``, ``worktree:<path>``, ``dir:<path>``.
+    ``None`` means the flag was omitted, so task creation may consult the
+    assignee profile's kanban workspace defaults.
     """
+    if value is None:
+        return (None, None)
     if not value:
         return ("scratch", None)
     v = value.strip()
@@ -333,9 +337,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
-    p_create.add_argument("--workspace", default="scratch",
-                          help="scratch | worktree | worktree:<path> | dir:<path> "
-                               "(default: scratch)")
+    p_create.add_argument("--workspace", default=None,
+                          help="scratch | worktree | worktree:<path> | dir:<path>. "
+                               "When omitted, uses the assignee profile's "
+                               "kanban.default_workspace_kind/path if set; "
+                               "otherwise scratch.")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
     p_create.add_argument("--project", default=None,
@@ -2185,26 +2191,38 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     pass
                 if judge_available:
                     from hermes_cli.goals import judge_goal
+                    import logging as _logging
+                    _logger = _logging.getLogger(__name__)
                     verdict = "done"
                     reason = ""
+                    transport_failed = False
                     try:
                         # judge_goal returns (verdict, reason, parse_failed,
                         # wait_directive, transport_failed) — see
                         # hermes_cli/goals.py. Unpacking fewer raises
                         # ValueError into the fail-open handler below,
                         # silently disabling the gate.
-                        verdict, reason, _, _, _ = judge_goal(
+                        verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
                             goal=f"{task.title}\n\n{task.body or ''}".strip(),
                             last_response=(summary or args.result or "").strip(),
                         )
                     except Exception as judge_exc:
-                        import logging as _logging
-                        _logging.getLogger(__name__).warning(
+                        _logger.warning(
                             "goal judge check failed, allowing completion: %s",
                             judge_exc,
                             exc_info=True,
                         )
-                    if verdict != "done":
+                    if transport_failed:
+                        # A judge transport failure is transient and judge_goal
+                        # already fails open (returns a "continue" verdict) — log
+                        # and proceed on the completion path rather than wedging
+                        # the goal_mode worker. Do not reject here.
+                        _logger.warning(
+                            "goal judge transport failed (unreachable), allowing "
+                            "completion: %s",
+                            reason,
+                        )
+                    elif verdict != "done":
                         print(
                             f"kanban: goal completion of {tid} rejected by judge: {reason}. "
                             f"Provide evidence matching the task's acceptance criteria.",

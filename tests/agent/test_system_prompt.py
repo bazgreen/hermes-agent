@@ -19,6 +19,8 @@ def _make_agent(**overrides):
         _kanban_worker_guidance="",
         _memory_store=None,
         _memory_manager=None,
+        _memory_enabled=False,
+        _user_profile_enabled=False,
         model="",
         provider="",
         platform="",
@@ -226,3 +228,25 @@ class TestTelegramRichMessagesHint:
             stable = _stable_prompt(agent)
         assert "Standard Markdown is automatically converted" in stable
         assert "lean into it" not in stable
+
+class TestMemoryBlocks:
+    def test_fleet_memory_is_appended_to_volatile_prompt(self):
+        memory_store = SimpleNamespace(
+            format_for_system_prompt=lambda target: {
+                "memory": "MEMORY BLOCK",
+                "fleet": "FLEET BLOCK",
+                "user": "USER BLOCK",
+            }.get(target)
+        )
+        agent = _make_agent(
+            _memory_store=memory_store,
+            _memory_enabled=True,
+            _user_profile_enabled=True,
+        )
+
+        volatile = build_system_prompt_parts(agent)["volatile"]
+        assert "MEMORY BLOCK" in volatile
+        assert "FLEET BLOCK" in volatile
+        assert "USER BLOCK" in volatile
+        assert volatile.index("MEMORY BLOCK") < volatile.index("FLEET BLOCK")
+        assert volatile.index("FLEET BLOCK") < volatile.index("USER BLOCK")

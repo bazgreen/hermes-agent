@@ -103,6 +103,122 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
+    _FLEET_STATUS_PROFILES = (
+        ("pt", "PT", 8653),
+        ("code", "Code", 8654),
+        ("life", "Life", 8655),
+        ("mgmt", "Mgmt", 8656),
+    )
+
+    @staticmethod
+    def _fleet_status_is_healthy(payload: dict[str, Any]) -> bool:
+        if not payload.get("reachable", False):
+            return False
+        if str(payload.get("status") or "").lower() not in {"ok", "healthy"}:
+            return False
+        if payload.get("provider_ok") is False:
+            return False
+        return not bool(payload.get("last_error"))
+
+    @staticmethod
+    def _format_uptime_compact(seconds: Any) -> str:
+        try:
+            total = max(0, int(float(seconds)))
+        except (TypeError, ValueError):
+            return ""
+        if total < 60:
+            return f"{total}s"
+        minutes = total // 60
+        if minutes < 60:
+            return f"{minutes}m"
+        hours = minutes // 60
+        if hours < 48:
+            return f"{hours}h"
+        return f"{hours // 24}d"
+
+    @staticmethod
+    def _compact_status_value(value: Any, *, max_len: int = 48) -> str:
+        text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1].rstrip() + "…"
+
+    def _render_fleet_status_summary(self, statuses: list[dict[str, Any]]) -> str:
+        lines = ["", "Fleet:"]
+        for item in statuses:
+            label = self._compact_status_value(item.get("label") or item.get("profile"), max_len=12)
+            healthy = self._fleet_status_is_healthy(item)
+            badge = "🟢" if healthy else "🔴"
+            state = "ok" if healthy else "degraded"
+            parts = [f"{badge} {label}: {state}"]
+
+            model = self._compact_status_value(item.get("model"), max_len=32)
+            if model:
+                parts.append(model)
+            uptime = self._format_uptime_compact(item.get("uptime_seconds"))
+            if uptime:
+                parts.append(f"up {uptime}")
+            task = item.get("task_summary")
+            if isinstance(task, dict) and task.get("id"):
+                task_id = self._compact_status_value(task.get("id"), max_len=16)
+                task_status = self._compact_status_value(task.get("status"), max_len=16)
+                task_text = task_id if not task_status else f"{task_id}/{task_status}"
+                parts.append(f"task {task_text}")
+
+            lines.append(" · ".join(parts))
+            if not healthy:
+                err = self._compact_status_value(
+                    item.get("last_error") or item.get("error") or "gateway unreachable",
+                    max_len=120,
+                )
+                lines.append(f"  last_error: {err}")
+        return "\n".join(lines)
+
+    async def _query_gateway_status(self, profile: str, label: str, port: int) -> dict[str, Any]:
+        """Fetch one local gateway's /api/status with a tight timeout."""
+
+        def _fetch() -> dict[str, Any]:
+            import json as _json
+            import urllib.error
+            import urllib.request
+
+            url = f"http://127.0.0.1:{port}/api/status"
+            try:
+                with urllib.request.urlopen(url, timeout=1.2) as response:  # nosec B310 - loopback-only status probe
+                    raw = response.read(64 * 1024)
+                    payload = _json.loads(raw.decode("utf-8")) if raw else {}
+                    if not isinstance(payload, dict):
+                        payload = {"status": "invalid", "last_error": f"unexpected {type(payload).__name__} response"}
+                    payload.update({"profile": profile, "label": label, "port": port, "reachable": True})
+                    return payload
+            except urllib.error.HTTPError as exc:
+                return {
+                    "profile": profile,
+                    "label": label,
+                    "port": port,
+                    "reachable": False,
+                    "status": "down",
+                    "last_error": f"HTTP {exc.code}",
+                }
+            except Exception as exc:
+                return {
+                    "profile": profile,
+                    "label": label,
+                    "port": port,
+                    "reachable": False,
+                    "status": "down",
+                    "last_error": str(exc),
+                }
+
+        return await asyncio.to_thread(_fetch)
+
+    async def _fleet_status_summary(self) -> str:
+        statuses = await asyncio.gather(*(
+            self._query_gateway_status(profile, label, port)
+            for profile, label, port in self._FLEET_STATUS_PROFILES
+        ))
+        return self._render_fleet_status_summary(list(statuses))
+
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
@@ -709,6 +825,17 @@ class GatewaySlashCommandsMixin:
             "",
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
         ])
+
+        try:
+            active_profile = self._active_profile_name()
+        except Exception:
+            active_profile = ""
+        if active_profile == "mgmt":
+            try:
+                lines.append(await self._fleet_status_summary())
+            except Exception as exc:
+                logger.warning("Failed to build fleet /status summary: %s", exc)
+                lines.extend(["", "Fleet:", f"🔴 unavailable · last_error: {exc}"])
 
         return "\n".join(lines)
 

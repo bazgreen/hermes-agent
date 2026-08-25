@@ -639,13 +639,14 @@ def _handle_complete(args: dict, **kw) -> str:
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
+                transport_failed = False
                 try:
                     # judge_goal returns (verdict, reason, parse_failed,
                     # wait_directive, transport_failed) — see
                     # hermes_cli/goals.py. Unpacking fewer raises ValueError,
                     # which the defensive handler below swallows, leaving
                     # verdict="done" and silently disabling the gate.
-                    verdict, reason, _, _, _ = judge_goal(
+                    verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
                         goal=f"{task.title}\n\n{task.body or ''}".strip(),
                         last_response=(summary or result or "").strip(),
                     )
@@ -657,7 +658,17 @@ def _handle_complete(args: dict, **kw) -> str:
                         judge_exc,
                         exc_info=True,
                     )
-                if verdict != "done":
+                if transport_failed:
+                    # A judge transport failure is transient and judge_goal
+                    # already fails open (returns a "continue" verdict) — log
+                    # and proceed on the completion path rather than wedging
+                    # the goal_mode worker. Do not tool_error here.
+                    logger.warning(
+                        "goal judge transport failed (unreachable), allowing "
+                        "completion: %s",
+                        reason,
+                    )
+                elif verdict != "done":
                     return tool_error(
                         f"Goal completion rejected by judge: {reason}. "
                         f"To proceed, either: (1) provide explicit acceptance "
@@ -1216,7 +1227,7 @@ def _handle_create(args: dict, **kw) -> str:
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
+                workspace_kind=(str(workspace_kind) if workspace_kind is not None else None),
                 workspace_path=workspace_path,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,

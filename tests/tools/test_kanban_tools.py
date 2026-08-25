@@ -215,6 +215,66 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         conn2.close()
 
 
+def test_complete_goal_mode_transport_failure_fails_open(monkeypatch, tmp_path, caplog):
+    """A judge transport failure (transport_failed=True) must not wedge the
+    worker: kanban_complete fails OPEN and logs a warning. Regression for the
+    quota-exhausted Kimi endpoint (PermissionDeniedError / HTTP 403)."""
+    import logging
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    goal_task_id = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+
+    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
+        # (verdict, reason, parse_failed, wait_directive, transport_failed)
+        return "continue", "judge error: PermissionDeniedError", False, None, True
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    with caplog.at_level(logging.WARNING, logger="tools.kanban_tools"):
+        out = kt._handle_complete({"summary": "done with evidence"})
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    assert any(
+        "transport failed" in rec.message for rec in caplog.records
+    ), f"expected a transport-failure warning, got: {[r.message for r in caplog.records]}"
+
+    conn2 = kb.connect()
+    try:
+        assert kb.get_task(conn2, goal_task_id).status == "done"
+    finally:
+        conn2.close()
+
+
+def test_complete_goal_mode_parse_failure_rejected(monkeypatch, tmp_path):
+    """A judge parse failure (parse_failed=True, transport_failed=False) is NOT
+    a transport failure: the non-done verdict must still reject completion.
+    Only transport_failed=True is allowed to fail open."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    goal_task_id = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+
+    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
+        # (verdict, reason, parse_failed, wait_directive, transport_failed)
+        return "continue", "judge error: mock", True, None, False
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    out = kt._handle_complete({"summary": "partial work, judge could not parse"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "Goal completion rejected by judge" in d["error"]
+
+    conn2 = kb.connect()
+    try:
+        assert kb.get_task(conn2, goal_task_id).status == "running"
+    finally:
+        conn2.close()
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})

@@ -142,6 +142,78 @@ async def test_status_command_includes_live_agent_model_and_context():
 
 
 @pytest.mark.asyncio
+async def test_mgmt_status_command_includes_compact_fleet_summary(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._active_profile_name = lambda: "mgmt"
+
+    async def _fake_query(profile, label, port):
+        payloads = {
+            "pt": {
+                "profile": profile,
+                "label": label,
+                "port": port,
+                "reachable": True,
+                "status": "ok",
+                "provider_ok": True,
+                "model": "deepseek-chat",
+                "uptime_seconds": 7200,
+            },
+            "code": {
+                "profile": profile,
+                "label": label,
+                "port": port,
+                "reachable": True,
+                "status": "ok",
+                "provider_ok": False,
+                "model": "openai-codex",
+                "last_error": "active provider probe HTTP 401",
+            },
+            "life": {
+                "profile": profile,
+                "label": label,
+                "port": port,
+                "reachable": False,
+                "status": "down",
+                "last_error": "connection refused",
+            },
+            "mgmt": {
+                "profile": profile,
+                "label": label,
+                "port": port,
+                "reachable": True,
+                "status": "ok",
+                "provider_ok": True,
+                "model": "openai-codex",
+                "task_summary": {"id": "t_91e4143e", "status": "running", "title": "Fleet status"},
+            },
+        }
+        return payloads[profile]
+
+    runner._query_gateway_status = _fake_query
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "Fleet:" in result
+    assert "🟢 PT: ok · deepseek-chat · up 2h" in result
+    assert "🔴 Code: degraded · openai-codex" in result
+    assert "  last_error: active provider probe HTTP 401" in result
+    assert "🔴 Life: degraded" in result
+    assert "  last_error: connection refused" in result
+    assert "🟢 Mgmt: ok · openai-codex · task t_91e4143e/running" in result
+    healthy_pt_line = next(line for line in result.splitlines() if "PT: ok" in line)
+    assert "last_error" not in healthy_pt_line
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(
