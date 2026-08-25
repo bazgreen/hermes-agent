@@ -3400,6 +3400,41 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def _record_autonomous_action(action: str, outcome: str, command: str, detail: str = "") -> None:
+    """Append an autonomous (no-human-in-the-loop) decision to the fleet audit log.
+
+    Best-effort observability: a write failure must never block or alter an
+    approval decision, so the append itself never raises. Failures are surfaced
+    — the helper logs a WARNING (and stderr fallback + failure counter) when the
+    append did not land — so a broken audit trail is observable rather than
+    silent. Lazy-imported to avoid a hard dependency at module load time.
+    ``command`` is truncated so a single line can never balloon.
+    """
+    try:
+        from tools.autonomous_actions import append_action
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("autonomous-actions module unavailable: %s", exc)
+        return
+    try:
+        record = append_action(
+            action=action,
+            outcome=outcome,
+            detail=detail or command,
+            extra={"command": command[:500]} if command else None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("autonomous-actions append failed: %s", exc, exc_info=True)
+        return
+    if not record.get("written"):
+        # The append helper already emitted a WARNING + stderr fallback; this is
+        # a second, contextual signal tied to the specific decision being logged.
+        logger.warning(
+            "autonomous-actions audit write FAILED for action=%r: %s",
+            action,
+            record.get("error", "unknown"),
+        )
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -3426,6 +3461,7 @@ def check_all_command_guards(command: str, env_type: str,
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
+        _record_autonomous_action("hardline_block", "blocked", command, hardline_desc)
         return _hardline_block_result(hardline_desc)
 
     # == Sudo stdin guard ==
@@ -3437,6 +3473,7 @@ def check_all_command_guards(command: str, env_type: str,
     if is_sudo_guess:
         logger.warning("Sudo stdin guard block: %s (command: %s)",
                        sudo_guess_desc, command[:200])
+        _record_autonomous_action("sudo_stdin_block", "blocked", command, sudo_guess_desc)
         return _sudo_stdin_block_result(sudo_guess_desc)
 
     # User-defined deny rules (approvals.deny in config.yaml): like the
@@ -3446,15 +3483,30 @@ def check_all_command_guards(command: str, env_type: str,
     if deny_pattern is not None:
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
+        _record_autonomous_action("user_deny_rule_block", "blocked", command, deny_pattern)
         return _user_deny_block_result(deny_pattern)
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+        # Record dangerous commands that are being auto-approved by the bypass
+        # so no autonomous decision silently disappears from the audit trail.
+        try:
+            is_dangerous, _pk, danger_desc = detect_dangerous_command(command)
+            if is_dangerous:
+                _record_autonomous_action(
+                    "auto_approve_dangerous_command", "success", command, danger_desc
+                )
+        except Exception:  # noqa: BLE001 - audit must never block the bypass
+            logger.debug("dangerous-command audit check failed", exc_info=True)
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
+        _record_autonomous_action(
+            "auto_approve_permanent_allowlist", "success", command,
+            "command matched the permanent allowlist",
+        )
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -3470,6 +3522,9 @@ def check_all_command_guards(command: str, env_type: str,
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
                 if is_dangerous:
+                    _record_autonomous_action(
+                        "cron_deny_command", "blocked", command, description
+                    )
                     return {
                         "approved": False,
                         "message": (
@@ -3489,6 +3544,9 @@ def check_all_command_guards(command: str, env_type: str,
                     _cron_tirith = check_command_security(command)
                     if _cron_tirith.get("action") in ("block", "warn"):
                         _cron_desc = _format_tirith_description(_cron_tirith)
+                        _record_autonomous_action(
+                            "cron_deny_command", "blocked", command, _cron_desc
+                        )
                         return {
                             "approved": False,
                             "message": (
@@ -3624,6 +3682,9 @@ def check_all_command_guards(command: str, env_type: str,
             # benign command suppress review of later commands that happen to
             # match the same broad detector category.
             _reset_denials(session_key)
+            _record_autonomous_action(
+                "smart_approve_command", "success", command, combined_desc_for_llm
+            )
             logger.debug("Smart approval: auto-approved '%s' (%s)",
                          command[:60], combined_desc_for_llm)
             return {"approved": True, "message": None,
@@ -3631,6 +3692,9 @@ def check_all_command_guards(command: str, env_type: str,
                     "description": combined_desc_for_llm}
         elif verdict == "deny" and not (is_cli or is_gateway or is_ask):
             _record_denial(session_key)
+            _record_autonomous_action(
+                "smart_deny_command", "blocked", command, combined_desc_for_llm
+            )
             breaker_addendum = _denial_breaker_addendum(session_key)
             return {
                 "approved": False,
@@ -3644,6 +3708,10 @@ def check_all_command_guards(command: str, env_type: str,
             # override still counts toward the consecutive-denial breaker;
             # a subsequent human approval resets the tally below.
             _record_denial(session_key)
+            _record_autonomous_action(
+                "smart_deny_command", "blocked", command,
+                f"{combined_desc_for_llm} (owner override pending)",
+            )
             smart_denied_for_owner = True
         # An interactive owner may override DENY for this operation only.
         # ESCALATE follows the normal, potentially persistent manual behavior.
@@ -3914,6 +3982,10 @@ def check_execute_code_guard(code: str, env_type: str,
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+        _record_autonomous_action(
+            "auto_approve_execute_code", "success", code or "",
+            "execute_code auto-approved under approvals.mode=off/yolo",
+        )
         return {"approved": True, "message": None}
 
     is_gateway = _is_gateway_approval_context()
@@ -3922,6 +3994,10 @@ def check_execute_code_guard(code: str, env_type: str,
     # Cron: no user is present to approve arbitrary code.
     if env_var_enabled("HERMES_CRON_SESSION"):
         if _get_cron_approval_mode() == "deny":
+            _record_autonomous_action(
+                "cron_deny_execute_code", "blocked", code or "",
+                "execute_code blocked in cron session (cron_mode=deny)",
+            )
             return {
                 "approved": False,
                 "message": (
@@ -3984,6 +4060,9 @@ def check_execute_code_guard(code: str, env_type: str,
             _reset_denials(session_key)
             approve_session(session_key, approval_key)
             _reset_denials(session_key)
+            _record_autonomous_action(
+                "smart_approve_execute_code", "success", code or "", description
+            )
             logger.debug("Smart approval: auto-approved execute_code for session %s",
                          session_key)
             return {"approved": True, "message": None,
@@ -3991,6 +4070,9 @@ def check_execute_code_guard(code: str, env_type: str,
                     "approval_key": approval_key}
         if verdict == "deny" and not (is_gateway or is_ask):
             _record_denial(session_key)
+            _record_autonomous_action(
+                "smart_deny_execute_code", "blocked", code or "", description
+            )
             breaker_addendum = _denial_breaker_addendum(session_key)
             return {
                 "approved": False,
@@ -4008,6 +4090,10 @@ def check_execute_code_guard(code: str, env_type: str,
             # override still counts toward the consecutive-denial breaker;
             # a subsequent human approval resets the tally below.
             _record_denial(session_key)
+            _record_autonomous_action(
+                "smart_deny_execute_code", "blocked", code or "",
+                f"{description} (owner override pending)",
+            )
             smart_denied_for_owner = True
         # Interactive DENY falls through to one-operation human approval;
         # ESCALATE retains the normal manual approval behavior.
