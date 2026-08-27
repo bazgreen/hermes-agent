@@ -1352,6 +1352,7 @@ def cronjob(
     prompt: Optional[str] = None,
     schedule: Optional[str] = None,
     fire_at: Optional[str] = None,
+    fireAt: Optional[str] = None,
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
@@ -1382,8 +1383,9 @@ def cronjob(
         normalized = (action or "").strip().lower()
 
         if normalized == "create":
-            schedule_input = (schedule or fire_at or "").strip() or None
-            if schedule and fire_at and schedule.strip() != fire_at.strip():
+            fire_at_alias = fireAt or fire_at
+            schedule_input = (schedule or fire_at_alias or "").strip() or None
+            if schedule and fire_at_alias and schedule.strip() != fire_at_alias.strip():
                 return tool_error(
                     "For one-shot jobs, use either schedule or fireAt — not both.",
                     success=False,
@@ -1812,8 +1814,8 @@ def cronjob(
                 repeat_state = dict(job.get("repeat") or {})
                 repeat_state["times"] = normalized_repeat
                 updates["repeat"] = repeat_state
-            if fire_at is not None or schedule is not None:
-                fire_at_text = (fire_at or "").strip()
+            if fire_at is not None or fireAt is not None or schedule is not None:
+                fire_at_text = (fireAt or fire_at or "").strip()
                 schedule_text = (schedule or "").strip()
                 if fire_at_text and schedule_text and fire_at_text != schedule_text:
                     return tool_error(
@@ -1870,11 +1872,11 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "schedule": {
                 "type": "string",
-                "description": "REQUIRED for create unless fireAt is supplied. '30m' (every 30 minutes), 'every 2h', cron syntax '0 9 * * *' (daily 9am), or an ISO timestamp for one-shot ('2026-06-01T09:00:00'). You MUST include this field when action=create unless you pass fireAt instead."
+                "description": "REQUIRED for create unless fireAt is supplied. '30m' (every 30 minutes), 'every 2h', cron syntax '0 9 * * *' (daily 9am), or an ISO timestamp for one-shot ('2026-06-01T00:00:00Z'). You MUST include this field when action=create unless you pass fireAt instead. One-shot timestamps older than the grace window are rejected."
             },
             "fireAt": {
                 "type": "string",
-                "description": "Optional alias for schedule when creating or updating a one-shot job. Use an ISO timestamp such as '2026-06-01T09:00:00'. If both schedule and fireAt are supplied they must match."
+                "description": "Optional alias for schedule when creating or updating a one-shot job. Use an ISO timestamp such as '2026-06-01T00:00:00Z'. If both schedule and fireAt are supplied they must match. One-shot timestamps older than the grace window are rejected."
             },
             "name": {
                 "type": "string",

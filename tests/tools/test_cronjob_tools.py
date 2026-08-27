@@ -272,6 +272,71 @@ class TestUnifiedCronjobTool:
         assert stored["next_run_at"] == fire_at
         assert stored["repeat"]["times"] == 1
 
+    def test_create_with_fire_at_alias_direct_call(self):
+        from cron.jobs import get_job
+
+        fire_at = "2030-01-15T14:00:00+00:00"
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                fireAt=fire_at,
+                name="One-shot direct",
+            )
+        )
+        assert created["success"] is True
+        assert created["schedule"] == "once at 2030-01-15 14:00"
+
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["schedule"]["kind"] == "once"
+        assert stored["schedule"]["run_at"] == fire_at
+        assert stored["next_run_at"] == fire_at
+        assert stored["repeat"]["times"] == 1
+
+    def test_create_rejects_past_fire_at_outside_grace_window(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                fireAt="2000-01-01T00:00:00+00:00",
+                name="Too old",
+            )
+        )
+        assert created["success"] is False
+        assert "cannot be scheduled" in created["error"]
+
+    def test_update_with_fire_at_alias_direct_call(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="every 1h",
+                name="Recurring direct",
+            )
+        )
+        assert created["success"] is True
+
+        fire_at = "2030-01-15T14:00:00+00:00"
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                fireAt=fire_at,
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["schedule"] == "once at 2030-01-15 14:00"
+
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["schedule"]["kind"] == "once"
+        assert stored["schedule"]["run_at"] == fire_at
+        assert stored["next_run_at"] == fire_at
+        assert stored["state"] == "scheduled"
+
     def test_update_with_fire_at_alias(self):
         from cron.jobs import get_job
         from tools.registry import registry
