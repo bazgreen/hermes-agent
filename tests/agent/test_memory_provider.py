@@ -199,10 +199,64 @@ class TestMemoryManager:
         assert p1.queued_prefetches == ["next turn"]
         assert p2.queued_prefetches == ["next turn"]
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "status?",
+            "STATUS?",
+            " status ? ",
+            "ok",
+            "Continue",
+            "K!",
+            "sounds good.",
+        ],
+    )
+    def test_low_information_prefetch_prompts_skip_both_paths(self, query):
+        mgr = MemoryManager()
+        p1 = FakeMemoryProvider("builtin")
+        p2 = FakeMemoryProvider("external")
+        mgr.add_provider(p1)
+        mgr.add_provider(p2)
 
+        assert mgr.prefetch_all(query) == ""
+        assert p1.prefetch_queries == []
+        assert p2.prefetch_queries == []
 
+        mgr.queue_prefetch_all(query)
+        mgr.flush_pending(timeout=5)
+        assert p1.queued_prefetches == []
+        assert p2.queued_prefetches == []
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "what is the current status?",
+            "give me a status update",
+            "deploy status check please",
+        ],
+    )
+    def test_status_related_substantive_prompts_still_prefetch(self, query):
+        mgr = MemoryManager()
+        p1 = FakeMemoryProvider("builtin")
+        p1._prefetch_result = "Memory from builtin"
+        p2 = FakeMemoryProvider("external")
+        p2._prefetch_result = "Memory from external"
+        mgr.add_provider(p1)
+        mgr.add_provider(p2)
+
+        result = mgr.prefetch_all(query)
+        assert "Memory from builtin" in result
+        assert "Memory from external" in result
+        assert p1.prefetch_queries == [query]
+        assert p2.prefetch_queries == [query]
+
+        mgr.queue_prefetch_all(query)
+        mgr.flush_pending(timeout=5)
+        assert p1.queued_prefetches == [query]
+        assert p2.queued_prefetches == [query]
 
     def test_sync_failure_doesnt_block_others(self):
+
         """If one provider's sync fails, others still run."""
         mgr = MemoryManager()
         p1 = FakeMemoryProvider("builtin")

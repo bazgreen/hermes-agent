@@ -50,6 +50,15 @@ logger = logging.getLogger(__name__)
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
+_LOW_INFORMATION_PREFETCH_QUERIES = frozenset({
+    "ok",
+    "continue",
+    "k",
+    "sounds good",
+    "status",
+})
+_LOW_INFORMATION_PREFETCH_STRIP_RE = re.compile(r"^[\s\W_]+|[\s\W_]+$")
+
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     """Return a function-tool dict with a resolvable top-level ``name``.
@@ -561,6 +570,18 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
+    @staticmethod
+    def _normalize_low_information_query(text: str) -> str:
+        """Normalize acknowledgement-style prompts for exact-match checks."""
+        text = text.casefold().strip()
+        text = _LOW_INFORMATION_PREFETCH_STRIP_RE.sub("", text)
+        return " ".join(text.split())
+
+    @classmethod
+    def _is_low_information_prefetch_query(cls, text: str) -> bool:
+        """Return True for trivial prompts that should skip prefetching."""
+        return cls._normalize_low_information_query(text) in _LOW_INFORMATION_PREFETCH_QUERIES
+
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Collect prefetch context from all providers.
 
@@ -568,7 +589,7 @@ class MemoryManager:
         are skipped. Failures in one provider don't block others.
         """
         clean_query = self._strip_skill_scaffolding(query)
-        if not clean_query:
+        if not clean_query or self._is_low_information_prefetch_query(clean_query):
             return ""
         parts = []
         for provider in self._providers:
@@ -682,7 +703,7 @@ class MemoryManager:
             return
 
         clean_query = self._strip_skill_scaffolding(query)
-        if not clean_query:
+        if not clean_query or self._is_low_information_prefetch_query(clean_query):
             return
 
         def _run() -> None:
