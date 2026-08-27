@@ -19,6 +19,8 @@ Cron jobs can:
 - run in fresh agent sessions with the normal static tool list
 - run in **no-agent mode** — a script on a schedule, its stdout delivered verbatim, zero LLM involvement (see the [no-agent mode](#no-agent-mode-script-only-jobs) section below)
 
+One-shot jobs can be expressed either as an ISO timestamp in `schedule` or via the clearer `fireAt` alias in the `cronjob` tool / CLI. Both arm exactly one run at the requested time.
+
 All of this is available to Hermes itself through the `cronjob` tool, so you can create, pause, edit, and remove jobs by asking in plain language — no CLI required.
 
 :::tip

@@ -246,6 +246,70 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_with_fire_at_alias(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        fire_at = "2030-01-15T14:00:00+00:00"
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "prompt": "Check server status",
+                    "fireAt": fire_at,
+                    "name": "One-shot",
+                },
+            )
+        )
+        assert created["success"] is True
+        assert created["schedule"] == "once at 2030-01-15 14:00"
+
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["schedule"]["kind"] == "once"
+        assert stored["schedule"]["run_at"] == fire_at
+        assert stored["next_run_at"] == fire_at
+        assert stored["repeat"]["times"] == 1
+
+    def test_update_with_fire_at_alias(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "prompt": "Check server status",
+                    "schedule": "every 1h",
+                    "name": "Recurring",
+                },
+            )
+        )
+        assert created["success"] is True
+
+        fire_at = "2030-01-15T14:00:00+00:00"
+        updated = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "update",
+                    "job_id": created["job_id"],
+                    "fireAt": fire_at,
+                },
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["schedule"] == "once at 2030-01-15 14:00"
+
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["schedule"]["kind"] == "once"
+        assert stored["schedule"]["run_at"] == fire_at
+        assert stored["next_run_at"] == fire_at
+        assert stored["state"] == "scheduled"
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

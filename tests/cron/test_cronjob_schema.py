@@ -17,5 +17,6 @@ def test_cronjob_schema_action_description_flags_create_requirements():
     assert "action=create" in action_desc
     assert "schedule" in action_desc
     assert "REQUIRED" in action_desc
+    assert "fireAt" in CRONJOB_SCHEMA["parameters"]["properties"]
 
 
