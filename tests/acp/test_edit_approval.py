@@ -112,22 +112,34 @@ def test_write_file_new_file_request_has_empty_old_text(tmp_path):
 def test_requester_exception_denies_and_does_not_mutate(tmp_path):
     target = tmp_path / "sample.txt"
     target.write_text("before\n", encoding="utf-8")
+    calls = {"count": 0}
 
     def boom(_proposal):
+        calls["count"] += 1
         raise RuntimeError("zed disconnected")
 
     set_edit_approval_requester(boom)
 
-    result = json.loads(
+    first_result = json.loads(
         handle_function_call(
             "write_file",
             {"path": str(target), "content": "after\n"},
             task_id="acp-edit-exception",
         )
     )
+    second_result = json.loads(
+        handle_function_call(
+            "write_file",
+            {"path": str(target), "content": "after-again\n"},
+            task_id="acp-edit-exception",
+        )
+    )
 
-    assert "error" in result
-    assert "Edit approval denied" in result["error"]
+    assert "error" in first_result
+    assert "Edit approval denied" in first_result["error"]
+    assert "error" in second_result
+    assert "Edit approval denied" in second_result["error"]
+    assert calls["count"] == 1
     assert target.read_text(encoding="utf-8") == "before\n"
 
 
