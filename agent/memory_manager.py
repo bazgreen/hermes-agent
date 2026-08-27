@@ -33,7 +33,7 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, is_trivial_prompt
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -529,7 +529,7 @@ class MemoryManager:
         are skipped. Failures in one provider don't block others.
         """
         clean_query = self._strip_skill_scaffolding(query)
-        if not clean_query:
+        if not clean_query or is_trivial_prompt(clean_query):
             return ""
         parts = []
         for provider in self._providers:
@@ -606,7 +606,7 @@ class MemoryManager:
             return
 
         clean_query = self._strip_skill_scaffolding(query)
-        if not clean_query:
+        if not clean_query or is_trivial_prompt(clean_query):
             return
 
         def _run() -> None:

@@ -75,7 +75,7 @@ def test_background_work_still_completes():
     mgr.add_provider(p)
 
     mgr.sync_all("hi", "hey", session_id="s1")
-    mgr.queue_prefetch_all("hi", session_id="s1")
+    mgr.queue_prefetch_all("prefetch this context", session_id="s1")
 
     assert mgr.flush_pending(timeout=10) is True
     assert p.sync_done is True

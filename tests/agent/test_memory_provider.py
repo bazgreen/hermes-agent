@@ -139,6 +139,36 @@ class TestMemoryProviderABC:
         p.shutdown()
 
 
+class TestTrivialPromptClassifier:
+    """is_trivial_prompt — shared gate for memory recall."""
+
+    def test_trivial_variants(self):
+        from agent.memory_provider import is_trivial_prompt
+
+        for text in (
+            "ok",
+            "continue",
+            "k",
+            "sounds good",
+            "status?",
+            "STATUS?",
+            " status ? ",
+        ):
+            assert is_trivial_prompt(text), f"expected trivial: {text!r}"
+
+    def test_substantive_prompt_passes_through(self):
+        from agent.memory_provider import is_trivial_prompt
+
+        for text in (
+            "what should I remember about the API?",
+            "what is the current status?",
+            "give me a status update",
+            "status of the mgmt box",
+            "k8s status",
+        ):
+            assert not is_trivial_prompt(text), f"expected substantive: {text!r}"
+
+
 # ---------------------------------------------------------------------------
 # MemoryManager tests
 # ---------------------------------------------------------------------------
@@ -247,6 +277,36 @@ class TestMemoryManager:
 
     # -- Error resilience ---------------------------------------------------
 
+
+    @pytest.mark.parametrize(
+        "query",
+        ("ok", "continue", "k", "sounds good", "status?"),
+    )
+    def test_trivial_turn_skips_prefetch_and_queue(self, query):
+        mgr = MemoryManager()
+        p = FakeMemoryProvider("builtin")
+        p._prefetch_result = "should not be used"
+        mgr.add_provider(p)
+
+        assert mgr.prefetch_all(query) == ""
+        mgr.queue_prefetch_all(query)
+        mgr.flush_pending(timeout=5)
+
+        assert p.prefetch_queries == []
+        assert p.queued_prefetches == []
+
+    def test_substantive_turn_still_calls_prefetch_and_queue(self):
+        mgr = MemoryManager()
+        p = FakeMemoryProvider("builtin")
+        p._prefetch_result = "Memory from builtin"
+        mgr.add_provider(p)
+
+        assert mgr.prefetch_all("what should I remember about the API?") == "Memory from builtin"
+        mgr.queue_prefetch_all("what should I remember about the API?")
+        mgr.flush_pending(timeout=5)
+
+        assert p.prefetch_queries == ["what should I remember about the API?"]
+        assert p.queued_prefetches == ["what should I remember about the API?"]
 
     def test_external_prefetch_timeout_skips_stuck_provider(self):
         mgr = MemoryManager(external_prefetch_timeout=0.01)
