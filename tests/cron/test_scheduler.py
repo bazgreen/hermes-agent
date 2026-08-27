@@ -689,6 +689,53 @@ class TestRunJobSessionPersistence:
         claim.assert_not_called()
         run_one.assert_not_called()
 
+    def test_fireat_one_shot_runs_once_at_or_after_the_requested_time(self, tmp_path, monkeypatch):
+        """fireAt one-shots should wait until due, then execute exactly once."""
+        from datetime import datetime, timedelta, timezone
+
+        from cron.jobs import create_job, get_job, mark_job_run
+        from cron.scheduler import tick
+
+        cron_dir = tmp_path / "cron"
+        monkeypatch.setattr("cron.jobs.CRON_DIR", cron_dir)
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", cron_dir / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", cron_dir / "output")
+
+        fire_at = datetime(2026, 7, 10, 12, 0, 0, tzinfo=timezone.utc)
+        before = fire_at - timedelta(seconds=1)
+        at_or_after = fire_at
+        later = fire_at + timedelta(minutes=5)
+
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: before)
+        job = create_job(prompt="Check server status", schedule=fire_at.isoformat(), deliver="local")
+
+        run_calls = []
+
+        def fake_run_one_job(job, adapters=None, loop=None, verbose=True):
+            run_calls.append(job["id"])
+            assert mark_job_run(job["id"], True)
+            return True
+
+        with patch("cron.scheduler.run_one_job", side_effect=fake_run_one_job) as run_one:
+            assert tick(verbose=False, sync=True) == 0
+            run_one.assert_not_called()
+
+            monkeypatch.setattr("cron.jobs._hermes_now", lambda: at_or_after)
+            assert tick(verbose=False, sync=True) == 1
+            run_one.assert_called_once()
+
+            monkeypatch.setattr("cron.jobs._hermes_now", lambda: later)
+            assert tick(verbose=False, sync=True) == 0
+            assert run_one.call_count == 1
+
+        assert run_calls == [job["id"]]
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["enabled"] is False
+        assert stored["state"] == "completed"
+        assert stored["next_run_at"] is None
+        assert stored["last_run_at"] is not None
+
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,
         tick() should mark the job as error so last_status != 'ok'.
