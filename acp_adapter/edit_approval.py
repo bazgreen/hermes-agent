@@ -42,6 +42,10 @@ _EDIT_APPROVAL_REQUESTER: ContextVar[EditApprovalRequester | None] = ContextVar(
 _PERMISSION_REQUEST_IDS = count(1)
 
 
+def _deny_edit_approval_requester(_proposal: EditProposal) -> bool:
+    return False
+
+
 SENSITIVE_AUTO_APPROVE_NAMES = {".env", ".env.local", ".env.production", "id_rsa", "id_ed25519"}
 AUTO_APPROVE_ASK = "ask"
 AUTO_APPROVE_WORKSPACE = "workspace_session"
@@ -254,6 +258,7 @@ def maybe_require_edit_approval(tool_name: str, arguments: dict[str, Any]) -> st
         approved = bool(requester(proposal))
     except Exception as exc:
         logger.warning("ACP edit approval requester failed: %s", exc)
+        _EDIT_APPROVAL_REQUESTER.set(_deny_edit_approval_requester)
         approved = False
 
     if approved:
