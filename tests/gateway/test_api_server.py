@@ -33,6 +33,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
+    _probe_active_provider_health,
     _redact_api_error_text,
     _request_agent_overrides,
     check_api_server_requirements,
@@ -306,6 +307,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
+    app.router.add_get("/api/status", adapter._handle_status)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/api/model/options", adapter._handle_model_options)
@@ -496,6 +498,197 @@ class TestHealthDetailedEndpoint:
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
 
+    @pytest.mark.asyncio
+    async def test_api_status_returns_machine_readable_snapshot(self, adapter):
+        app = _create_app(adapter)
+        adapter._started_at_monotonic = time.monotonic() - 12.5
+        with (
+            patch.object(adapter, "_status_task_summary", return_value={"id": "t_123", "status": "in_progress", "title": "Work on code"}),
+            patch.object(adapter, "_status_memory_used_chars", return_value=1234),
+            patch.object(adapter, "_status_memory_limit_chars", return_value=2200),
+            patch.object(adapter, "_toolsets", ["browser", "terminal"]),
+            patch("gateway.platforms.api_server._probe_active_provider_health", new=AsyncMock(return_value=(True, None))),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/status")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "ok"
+                assert data["platform"] == "hermes-agent"
+                assert data["profile"] == adapter._profile_name
+                assert data["model"] == adapter._model_name
+                assert data["task_summary"] == {"id": "t_123", "status": "in_progress", "title": "Work on code"}
+                assert data["memory_used_chars"] == 1234
+                assert data["memory_limit_chars"] == 2200
+                assert data["toolsets"] == ["browser", "terminal"]
+                assert data["provider_ok"] is True
+                assert data["last_error"] is None
+                assert isinstance(data["pid"], int)
+                assert data["uptime_seconds"] >= 12
+
+    @pytest.mark.asyncio
+    async def test_api_status_surfaces_provider_probe_failure(self, adapter):
+        app = _create_app(adapter)
+        with (
+            patch.object(adapter, "_status_task_summary", return_value={"id": None, "status": None, "title": None}),
+            patch.object(adapter, "_status_memory_used_chars", return_value=0),
+            patch.object(adapter, "_status_memory_limit_chars", return_value=2200),
+            patch.object(adapter, "_toolsets", []),
+            patch("gateway.platforms.api_server._probe_active_provider_health", new=AsyncMock(return_value=(False, "active provider probe timed out after 1.0s"))),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/status")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["provider_ok"] is False
+                assert data["last_error"] == "active provider probe timed out after 1.0s"
+                assert data["status"] == "ok"
+                assert data["platform"] == "hermes-agent"
+
+    @pytest.mark.asyncio
+    async def test_active_provider_health_probes_codex_models_endpoint(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: "openai-codex")
+        monkeypatch.setattr(
+            "hermes_cli.auth.get_auth_status",
+            lambda provider_id=None: {"logged_in": True, "api_key": "header.payload.signature"},
+        )
+        calls = {}
+
+        class FakeResponse:
+            status_code = 200
+            text = "{\"models\": []}"
+
+        def fake_get(url, headers=None, timeout=None, follow_redirects=None):
+            calls.update({"url": url, "headers": headers, "timeout": timeout, "follow_redirects": follow_redirects})
+            return FakeResponse()
+
+        monkeypatch.setattr("httpx.get", fake_get)
+
+        ok, last_error = await _probe_active_provider_health()
+
+        assert ok is True
+        assert last_error is None
+        assert calls["url"] == "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
+        assert calls["headers"]["Authorization"] == "Bearer header.payload.signature"
+        assert calls["headers"]["originator"] == "codex_cli_rs"
+        assert calls["timeout"] == 1.0
+        assert calls["follow_redirects"] is False
+
+    @pytest.mark.asyncio
+    async def test_active_provider_health_probes_api_key_models_endpoint(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: "openai-api")
+        monkeypatch.setattr(
+            "hermes_cli.auth.get_auth_status",
+            lambda provider_id=None: {"logged_in": True, "api_key": "sk-test"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            lambda provider_id: {
+                "provider": provider_id,
+                "api_key": "sk-test",
+                "base_url": "https://api.openai.com/v1",
+                "source": "env",
+            },
+        )
+        calls = {}
+
+        class FakeResponse:
+            status_code = 200
+            text = "{\"data\": []}"
+
+        def fake_get(url, headers=None, timeout=None, follow_redirects=None):
+            calls.update({"url": url, "headers": headers, "timeout": timeout, "follow_redirects": follow_redirects})
+            return FakeResponse()
+
+        monkeypatch.setattr("httpx.get", fake_get)
+
+        ok, last_error = await _probe_active_provider_health()
+
+        assert ok is True
+        assert last_error is None
+        assert calls["url"] == "https://api.openai.com/v1/models"
+        assert calls["headers"]["Authorization"] == "Bearer sk-test"
+        assert calls["timeout"] == 1.0
+        assert calls["follow_redirects"] is False
+
+    @pytest.mark.asyncio
+    async def test_active_provider_health_times_out(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: "openai-api")
+        monkeypatch.setattr(
+            "hermes_cli.auth.get_auth_status",
+            lambda provider_id=None: {"logged_in": True, "api_key": "sk-test"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            lambda provider_id: {
+                "provider": provider_id,
+                "api_key": "sk-test",
+                "base_url": "https://api.openai.com/v1",
+                "source": "env",
+            },
+        )
+        monkeypatch.setattr("gateway.platforms.api_server._STATUS_PROVIDER_PROBE_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr("gateway.platforms.api_server.asyncio.to_thread", lambda *args, **kwargs: asyncio.sleep(0.05))
+
+        ok, last_error = await _probe_active_provider_health()
+
+        assert ok is False
+        assert last_error == "active provider probe timed out after 0.0s"
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_no_runtime_status(self, adapter):
+        """When gateway_state.json is missing, fields are None."""
+        app = _create_app(adapter)
+        with patch("gateway.status.read_runtime_status", return_value=None):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "degraded"
+                assert data["readiness"]["checks"]["gateway"]["status"] == "degraded"
+                assert data["gateway_state"] is None
+                assert data["platforms"] == {}
+                # No runtime file ⇒ state None ⇒ not busy, not drainable.
+                assert data["gateway_busy"] is False
+                assert data["gateway_drainable"] is False
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_requires_auth(self, auth_adapter):
+        """Detailed health must not leak runtime state without Bearer auth."""
+        app = _create_app(auth_adapter)
+        with patch("gateway.status.read_runtime_status", return_value=None):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_allows_authenticated_request(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        headers = {"Authorization": f"Bearer {auth_adapter._api_key}"}
+        with patch("gateway.status.read_runtime_status", return_value={"gateway_state": "running"}):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed", headers=headers)
+                assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_reports_runtime_readiness(self, adapter):
+        """Detailed health exposes bounded readiness probes without changing /health."""
+        app = _create_app(adapter)
+        expected = {
+            "status": "degraded",
+            "checks": {
+                "state_db": {"status": "ok"},
+                "config": {"status": "degraded", "detail": "invalid config"},
+            },
+        }
+        with patch("gateway.status.read_runtime_status", return_value={"gateway_state": "running"}), \
+             patch("gateway.platforms.api_server.collect_runtime_readiness", return_value=expected):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/health/detailed")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["status"] == "degraded"
+                assert data["readiness"] == expected
 
     @pytest.mark.asyncio
     async def test_public_health_does_not_run_readiness_probes(self, adapter):

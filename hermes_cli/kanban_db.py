@@ -161,6 +161,38 @@ def _assert_not_delegated_child_mutation() -> None:
         )
 
 
+def _profile_kanban_workspace_defaults(assignee: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+
+    """Return (workspace_kind, workspace_path) defaults for an assignee profile.
+
+    Profiles can opt their own incoming tasks into persistent workspaces without
+    every caller remembering ``--workspace``.  This is intentionally read from
+    the assignee profile, not the creator profile: an orchestrator running as
+    ``mgmt`` that creates work for ``code`` should get Code's isolation policy.
+    """
+    if not assignee:
+        return None, None
+    try:
+        import yaml
+        from hermes_cli.profiles import get_profile_dir
+
+        cfg_path = get_profile_dir(assignee) / "config.yaml"
+        if not cfg_path.exists():
+            return None, None
+        data = yaml.safe_load(cfg_path.read_text()) or {}
+        kanban_cfg = data.get("kanban") or {}
+        if not isinstance(kanban_cfg, dict):
+            return None, None
+        kind = kanban_cfg.get("default_workspace_kind")
+        path = kanban_cfg.get("default_workspace_path")
+        kind_s = str(kind).strip() if kind is not None else ""
+        path_s = str(path).strip() if path is not None else ""
+        return (kind_s or None), (path_s or None)
+    except Exception:
+        # Defaults are a convenience, not a task-creation hard dependency.
+        return None, None
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
 
@@ -2890,6 +2922,22 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    explicit_workspace_kind = workspace_kind is not None and str(workspace_kind).strip() != ""
+    if workspace_kind is not None:
+        workspace_kind = str(workspace_kind).strip() or None
+    if (
+        not explicit_workspace_kind
+        and workspace_path is None
+        and branch_name is None
+        and project_id is None
+    ):
+        default_kind, default_path = _profile_kanban_workspace_defaults(assignee)
+        if default_kind:
+            workspace_kind = default_kind
+            if default_path:
+                workspace_path = default_path
+    if workspace_kind is None:
+        workspace_kind = "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "

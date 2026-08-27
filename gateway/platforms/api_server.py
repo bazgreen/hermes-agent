@@ -21,6 +21,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
+- POST /api/agentmail-webhook      — receive AgentMail email events (forwarded by agentmail-webhook.py)
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
 AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
@@ -117,6 +118,189 @@ def _hermes_version() -> str:
         return version("hermes-agent")
     except Exception:
         return "dev"
+
+
+_STATUS_PROVIDER_PROBE_TIMEOUT_SECONDS = 1.0
+
+
+def _codex_probe_headers(access_token: str) -> Dict[str, str]:
+    """Build the minimal Codex Cloudflare-safe probe headers."""
+    headers = {
+        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
+        "originator": "codex_cli_rs",
+    }
+    token = (access_token or "").strip()
+    if not token:
+        return headers
+
+    headers["Authorization"] = f"Bearer {token}"
+    try:
+        import base64
+
+        parts = token.split(".")
+        if len(parts) < 2:
+            return headers
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+        if isinstance(acct_id, str) and acct_id:
+            headers["ChatGPT-Account-ID"] = acct_id
+    except Exception:
+        pass
+    return headers
+
+
+async def _probe_active_provider_health() -> tuple[bool, Optional[str]]:
+    """Return the active provider's health as ``(ok, last_error)``.
+
+    The probe is intentionally tiny: one bounded live request off the event loop.
+    That keeps ``/api/status`` predictable while still surfacing provider
+    reachability instead of merely checking config presence.
+    """
+    try:
+        from hermes_cli.auth import (
+            DEFAULT_CODEX_BASE_URL,
+            PROVIDER_REGISTRY,
+            get_active_provider,
+            get_auth_status,
+            resolve_api_key_provider_credentials,
+        )
+    except Exception as exc:
+        return False, f"auth status unavailable: {exc}"
+
+    provider_id = (get_active_provider() or "").strip().lower()
+    if not provider_id:
+        return False, "no active provider configured"
+
+    try:
+        provider_status = get_auth_status(provider_id)
+    except Exception as exc:
+        return False, f"active provider status unavailable: {exc}"
+
+    if not isinstance(provider_status, dict):
+        return False, f"active provider status returned {type(provider_status).__name__}"
+
+    provider_config = PROVIDER_REGISTRY.get(provider_id)
+    token = (
+        str(provider_status.get("api_key") or "").strip()
+        or str(provider_status.get("access_token") or "").strip()
+    )
+
+    probe_url = ""
+    probe_headers: Dict[str, str] = {}
+
+    if provider_id == "openai-codex":
+        if not token:
+            return False, str(provider_status.get("error") or "codex provider has no active access token")
+        probe_url = f"{DEFAULT_CODEX_BASE_URL.rstrip('/')}/models?client_version=1.0.0"
+        probe_headers = _codex_probe_headers(token)
+    elif provider_config and provider_config.auth_type == "api_key":
+        try:
+            creds = resolve_api_key_provider_credentials(provider_id)
+        except Exception as exc:
+            return False, f"active provider credentials unavailable: {exc}"
+
+        api_key = str(creds.get("api_key") or "").strip()
+        base_url = str(creds.get("base_url") or provider_config.inference_base_url or "").strip().rstrip("/")
+        if not api_key:
+            return False, str(provider_status.get("error") or f"{provider_id} has no configured API key")
+
+        if provider_id == "anthropic" or base_url.endswith("api.anthropic.com"):
+            probe_url = f"{base_url}/v1/models" if not base_url.endswith("/v1") else f"{base_url}/models"
+            probe_headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+        elif "generativelanguage.googleapis.com" in base_url:
+            probe_url = f"{base_url}/models"
+            probe_headers = {"x-goog-api-key": api_key}
+        else:
+            try:
+                from agent.auxiliary_client import _to_openai_base_url
+
+                base_url = _to_openai_base_url(base_url)
+            except Exception:
+                pass
+            probe_url = f"{base_url}/models"
+            probe_headers = {"Authorization": f"Bearer {api_key}"}
+    elif provider_config and provider_config.auth_type in {"oauth_external", "oauth_minimax"}:
+        if not token:
+            return False, str(provider_status.get("error") or f"{provider_id} has no active access token")
+        base_url = str(provider_config.inference_base_url or provider_status.get("base_url") or "").strip().rstrip("/")
+        if not base_url:
+            return False, f"{provider_id} has no inference base URL configured"
+        probe_url = f"{base_url}/models"
+        probe_headers = {"Authorization": f"Bearer {token}"}
+    elif provider_config and provider_config.auth_type == "aws_sdk":
+        try:
+            from agent.bedrock_adapter import has_aws_credentials
+        except Exception as exc:
+            return False, f"active provider probe unavailable: {exc}"
+        if not has_aws_credentials():
+            return False, "AWS credentials not configured"
+
+        def _probe_bedrock() -> tuple[bool, Optional[str]]:
+            try:
+                import boto3
+                from botocore.config import Config as _BotoConfig
+
+                client = boto3.client(
+                    "bedrock",
+                    region_name=provider_status.get("region") or None,
+                    config=_BotoConfig(connect_timeout=5, read_timeout=10, retries={"max_attempts": 1}),
+                )
+                client.list_foundation_models()
+                return True, None
+            except Exception as exc:
+                return False, f"active provider probe failed: {exc}"
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_probe_bedrock),
+                timeout=_STATUS_PROVIDER_PROBE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return False, f"active provider probe timed out after {_STATUS_PROVIDER_PROBE_TIMEOUT_SECONDS:.1f}s"
+    else:
+        if not token:
+            return False, str(provider_status.get("error") or f"{provider_id} has no active access token")
+        base_url = str(provider_status.get("base_url") or getattr(provider_config, "inference_base_url", "") or "").strip().rstrip("/")
+        if not base_url:
+            return False, f"{provider_id} has no inference base URL configured"
+        probe_url = f"{base_url}/models"
+        probe_headers = {"Authorization": f"Bearer {token}"}
+
+    if not probe_url:
+        return False, f"active provider probe could not build a request for {provider_id}"
+
+    def _probe() -> tuple[bool, Optional[str]]:
+        try:
+            import httpx
+
+            response = httpx.get(
+                probe_url,
+                headers=probe_headers,
+                timeout=_STATUS_PROVIDER_PROBE_TIMEOUT_SECONDS,
+                follow_redirects=False,
+            )
+        except httpx.TimeoutException:
+            return False, f"active provider probe timed out after {_STATUS_PROVIDER_PROBE_TIMEOUT_SECONDS:.1f}s"
+        except Exception as exc:
+            return False, f"active provider probe failed: {exc}"
+
+        if 200 <= response.status_code < 300:
+            return True, None
+
+        detail = response.text.strip().splitlines()[0] if response.text else ""
+        suffix = f": {detail[:160]}" if detail else ""
+        return False, f"active provider probe HTTP {response.status_code}{suffix}"
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_probe),
+            timeout=_STATUS_PROVIDER_PROBE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return False, f"active provider probe timed out after {_STATUS_PROVIDER_PROBE_TIMEOUT_SECONDS:.1f}s"
+    except Exception as exc:
+        return False, f"active provider probe failed: {exc}"
 
 
 # Default settings
@@ -1234,6 +1418,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
+        self._started_at_monotonic = time.monotonic()
+        self._profile_name = self._resolve_profile_name()
+        self._toolsets = self._resolve_toolsets()
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
@@ -1403,6 +1590,19 @@ class APIServerAdapter(BasePlatformAdapter):
         return max(0, value)
 
     @staticmethod
+    def _resolve_profile_name() -> str:
+        """Return the active Hermes profile name for status reporting."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name()
+            if profile:
+                return str(profile)
+        except Exception:
+            pass
+        return "default"
+
+    @staticmethod
     def _resolve_model_name(explicit: str) -> str:
         """Derive the advertised model name for /v1/models.
 
@@ -1426,6 +1626,23 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return resolve_effective_model(explicit, profile_name, "hermes-agent")
+
+    def _resolve_toolsets(self) -> list[str]:
+        """Resolve configured api_server toolsets once at startup."""
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.tools_config import _get_platform_tools
+
+            config = load_config()
+            toolsets = _get_platform_tools(
+                config,
+                "api_server",
+                include_default_mcp_servers=False,
+            )
+            return sorted(str(name) for name in toolsets)
+        except Exception:
+            logger.debug("Failed to resolve api_server toolsets for /api/status", exc_info=True)
+            return []
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -1809,12 +2026,15 @@ class APIServerAdapter(BasePlatformAdapter):
         routes: List[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
+            ("GET", "/api/status", self._handle_status),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("POST", "/api/agentmail-webhook", self._handle_agentmail_webhook),
+            ("POST", "/api/handoff", self._handle_handoff),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -2747,6 +2967,449 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    async def _handle_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/status — lightweight machine-readable gateway snapshot."""
+        from gateway.status import read_runtime_status
+
+        runtime = read_runtime_status() or {}
+        provider_ok = False
+        last_error: Optional[str] = None
+        try:
+            provider_ok, last_error = await _probe_active_provider_health()
+        except Exception as exc:
+            provider_ok = False
+            last_error = str(exc)
+
+        if last_error is None:
+            last_error = runtime.get("platforms", {}).get(self.platform.value, {}).get("error_message")
+
+        payload = {
+            "status": "ok",
+            "platform": "hermes-agent",
+            "version": _hermes_version(),
+            "profile": getattr(self, "_profile_name", "default"),
+            "uptime_seconds": max(0.0, time.monotonic() - getattr(self, "_started_at_monotonic", time.monotonic())),
+            "model": getattr(self, "_model_name", "hermes-agent"),
+            "task_summary": self._status_task_summary(),
+            "memory_used_chars": self._status_memory_used_chars(),
+            "memory_limit_chars": self._status_memory_limit_chars(),
+            "toolsets": list(getattr(self, "_toolsets", [])),
+            "provider_ok": provider_ok,
+            "last_error": last_error,
+            "pid": os.getpid(),
+        }
+        return web.json_response(payload)
+
+    def _status_task_summary(self) -> Optional[Dict[str, Any]]:
+        """Return the current kanban task summary when available."""
+        task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        if not task_id:
+            return {"id": None, "status": None, "title": None}
+        try:
+            from hermes_cli import kanban_db
+
+            with kanban_db.connect() as conn:
+                task = kanban_db.get_task(conn, task_id)
+        except Exception:
+            logger.debug("Failed to resolve kanban task summary for /api/status", exc_info=True)
+            return {"id": task_id, "status": None, "title": None}
+        if not task:
+            return {"id": task_id, "status": None, "title": None}
+        return {"id": task.id, "status": task.status, "title": task.title}
+
+    def _status_memory_limit_chars(self) -> int:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+            memory_cfg = config.get("memory", {}) if isinstance(config.get("memory"), dict) else {}
+            return int(memory_cfg.get("memory_char_limit", 2200))
+        except Exception:
+            return 2200
+
+    def _status_memory_used_chars(self) -> int:
+        try:
+            from tools.memory_tool import MemoryStore
+            from hermes_cli.config import load_config
+
+            config = load_config()
+            memory_cfg = config.get("memory", {}) if isinstance(config.get("memory"), dict) else {}
+            store = MemoryStore(
+                memory_char_limit=int(memory_cfg.get("memory_char_limit", 2200)),
+                user_char_limit=int(memory_cfg.get("user_char_limit", 1375)),
+            )
+            store.load_from_disk()
+            return store._char_count("memory")
+        except Exception:
+            try:
+                from tools.memory_tool import get_memory_dir
+
+                path = get_memory_dir() / "MEMORY.md"
+                if path.exists():
+                    return len(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            return 0
+
+    async def _handle_agentmail_webhook(self, request: "web.Request") -> "web.Response":
+        """POST /api/agentmail-webhook — receive AgentMail email events.
+
+        Handles ``message.received`` events forwarded from the AgentMail
+        webhook receiver. Accepts the event, logs the relevant metadata,
+        and returns 200 immediately.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        event_type = body.get("event_type", "unknown")
+        event_id = body.get("event_id", "unknown")
+        message = body.get("message", {})
+        inbox_id = message.get("inbox_id", "unknown")
+        subject = message.get("subject", "(no subject)")
+        sender = ", ".join(message.get("from_", ["unknown"]))
+
+        logger.info(
+            "[agentmail-webhook] %s id=%s inbox=%s from=%s subject=%s",
+            event_type,
+            event_id,
+            inbox_id,
+            sender,
+            subject,
+        )
+
+        return web.json_response({"status": "received"})
+
+    async def _handle_handoff(self, request: "web.Request") -> "web.Response":
+        """POST /api/handoff — bot-to-bot handoff endpoint.
+
+        Receives structured requests from other Hermes gateways and executes
+        a tool on this gateway's behalf.
+
+        Auth:
+            1. X-Handoff-Auth header must match the configured shared secret.
+            2. ``from`` field must be in the profile's ``handoff.allowed_sources``
+               list (or the global ``handoff.allowed_sources`` in config.yaml).
+            3. If ``allowed_sources`` is passed in the request body, it is used
+               instead of the server config (caller-driven restriction).
+
+        Request body::
+
+            {
+                "from": "code",
+                "action": "tool_call",
+                "tool": "terminal",
+                "params": {"command": "date"},
+                "allowed_sources": ["code", "mgmt"]  # optional, overrides server config
+            }
+
+        Response (200)::
+
+            {"result": {<tool output dict>}}
+
+        Error responses:
+            401 — Invalid or missing X-Handoff-Auth
+            403 — Source not in allowed_sources
+            404 — Tool not found
+            504 — Tool execution timed out
+        """
+        from hermes_tools.handoff import HandoffError as _HE
+
+        # --- Auth step 1: shared secret ---
+        secret_cfg = self._handoff_config()
+        handoff_secret = secret_cfg.get("secret", "")
+        if not handoff_secret:
+            logger.warning(
+                "Handoff request received but no handoff.secret configured. "
+                "Add handoff: {secret: ...} to config.yaml"
+            )
+            return web.json_response(
+                {"error": "Handoff not configured on this gateway"},
+                status=501,
+            )
+
+        auth_header = request.headers.get("X-Handoff-Auth", "")
+        req_from = "unknown"
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        req_from = body.get("from", "unknown")
+        if not hmac.compare_digest(auth_header, handoff_secret):
+            logger.warning(
+                "Handoff auth rejected for from=%s: %s",
+                req_from,
+                self._request_audit_log_suffix(request),
+            )
+            return web.json_response({"error": "Invalid handoff auth"}, status=401)
+
+        # --- Auth step 2: source allowlisting ---
+        from_bot = body.get("from", "")
+        allowed = body.get("allowed_sources") or secret_cfg.get("allowed_sources", [])
+        if allowed and from_bot not in allowed:
+            logger.warning(
+                "Handoff source %r not in allowed_sources=%s",
+                from_bot,
+                allowed,
+            )
+            return web.json_response(
+                {"error": f"Source {from_bot!r} not allowed"},
+                status=403,
+            )
+
+        # --- Validate action ---
+        action = body.get("action", "")
+        if action not in {"tool_call", "summon"}:
+            return web.json_response(
+                {"error": f"Unsupported action {action!r}; only 'tool_call' and 'summon' are supported"},
+                status=400,
+            )
+
+        if action == "tool_call":
+            tool_name = body.get("tool", "")
+            params = body.get("params", {})
+            if not tool_name:
+                return web.json_response({"error": "Missing 'tool' field"}, status=400)
+
+            # --- Resolve and execute tool ---
+            timeout = secret_cfg.get("timeout", 30.0)
+            try:
+                result = await self._run_handoff_tool(tool_name, params, timeout=timeout)
+                if isinstance(result, web.Response):
+                    return result  # already a web.Response
+                return web.json_response({"result": result})
+            except _HE as exc:
+                status = exc.status if exc.status and exc.status >= 400 else 500
+                return web.json_response({"error": exc.detail}, status=status)
+            except Exception as exc:
+                logger.exception("Handoff tool %r failed", tool_name)
+                return web.json_response(
+                    {"error": f"Handoff tool execution failed: {exc}"},
+                    status=500,
+                )
+
+        query = body.get("query", "")
+        if not isinstance(query, str) or not query.strip():
+            return web.json_response({"error": "Missing 'query' field"}, status=400)
+        context_pack = body.get("context_pack")
+
+        timeout = secret_cfg.get("summon_timeout", 60.0)
+        try:
+            summon_kwargs = {"query": query, "timeout": timeout}
+            if context_pack is not None:
+                summon_kwargs["context_pack"] = context_pack
+            result = await self._run_handoff_summon(**summon_kwargs)
+            return web.json_response(result)
+        except _HE as exc:
+            status = exc.status if exc.status and exc.status >= 400 else 500
+            return web.json_response({"error": exc.detail}, status=status)
+        except Exception as exc:
+            logger.exception("Handoff summon failed")
+            return web.json_response(
+                {"error": f"Handoff summon execution failed: {exc}"},
+                status=500,
+            )
+
+    def _handoff_config(self) -> dict:
+        """Return the handoff config block from the active YAML profile config.
+
+        Reads ``handoff: {secret: ..., allowed_sources: [...], timeout: ...}``
+        from the profile's config.yaml, with ``~/.hermes/config.yaml`` as the
+        primary source and a fallback to env vars.
+
+        Returns a dict (possibly empty). Callers must handle a missing 'secret'.
+        """
+        import yaml as _yaml
+        from pathlib import Path as _Path
+
+        cfg: dict = {}
+        try:
+            from hermes_cli.config import get_hermes_home
+            profile_cfg = _Path(get_hermes_home()) / "config.yaml"
+            if profile_cfg.exists():
+                with open(profile_cfg, encoding="utf-8") as f:
+                    loaded = _yaml.safe_load(f) or {}
+                    cfg = loaded.get("handoff", {})
+        except Exception:
+            pass
+
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        # Merge in env var overrides
+        env_secret = os.environ.get("HERMES_HANDOFF_SECRET")
+        if env_secret:
+            cfg["secret"] = env_secret
+        env_timeout = os.environ.get("HERMES_HANDOFF_TIMEOUT")
+        if env_timeout:
+            try:
+                cfg["timeout"] = float(env_timeout)
+            except (TypeError, ValueError):
+                pass
+
+        return cfg
+
+    async def _run_handoff_tool(
+        self,
+        tool_name: str,
+        params: dict,
+        *,
+        timeout: float = 30.0,
+    ) -> dict:
+        """Resolve and execute a named tool from the gateway's process env.
+
+        This imports and calls the raw tool function directly
+        (not through AIAgent, which is too heavy for a handoff).
+
+        Tool modules are expected under ``tools.<tool_name>_tool`` (the
+        naming convention used by Hermes built-in tools: ``terminal_tool``,
+        ``read_file`` as ``tools/terminal_tool.py``, etc.).
+
+        Returns the raw result dict on success.
+
+        Raises:
+            HandoffError from hermes_tools.handoff on lookup/execution failure.
+        """
+        from hermes_tools.handoff import HandoffError as _HE
+        import importlib as _il
+
+        # Map tool names to their module paths
+        # Built-in Hermes tools live in tools/<name>_tool.py
+        # and are exposed as functions named <name>_tool()
+        TOOL_MODULE_MAP = {
+            "terminal": ("tools.terminal_tool", "terminal_tool"),
+            "read_file": ("tools.file_tools", "read_file_tool"),
+            "write_file": ("tools.file_tools", "write_file_tool"),
+            "echo": (None, None),  # special: synthetic tool
+            "search_files": ("tools.file_tools", "search_tool"),
+            "web_search": ("tools.web_tools", "web_search_tool"),
+            "web_extract": ("tools.web_tools", "web_extract_tool"),
+            "memory": ("tools.memory_tool", "memory_tool"),
+            "todo": ("tools.todo_tool", "todo_tool"),
+        }
+
+        # --- Special tools ---
+        if tool_name == "echo":
+            return {"echoed": params.get("text", "")}
+
+        # --- Look up tool ---
+        entry = TOOL_MODULE_MAP.get(tool_name)
+        if entry is None:
+            raise _HE(
+                f"Tool {tool_name!r} not found in handoff registry",
+                status=404,
+            )
+
+        mod_path, func_name = entry
+        try:
+            mod = _il.import_module(mod_path)
+        except (ImportError, ModuleNotFoundError):
+            raise _HE(
+                f"Tool module {mod_path!r} could not be loaded",
+                status=404,
+            )
+
+        func = getattr(mod, func_name, None)
+        if func is None:
+            raise _HE(
+                f"Function {func_name!r} not found in module {mod_path!r}",
+                status=404,
+            )
+
+        # --- Execute with timeout ---
+        try:
+            if asyncio.iscoroutinefunction(func):
+                result = await asyncio.wait_for(func(**params), timeout=timeout)
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(func, **params),
+                    timeout=timeout,
+                )
+        except asyncio.TimeoutError:
+            raise _HE(
+                f"Tool {tool_name!r} timed out after {timeout}s",
+                status=504,
+            )
+        except Exception as exc:
+            raise _HE(
+                f"Tool {tool_name!r} execution failed: {exc}",
+                status=500,
+            )
+
+        return {"result": result}
+
+    async def _run_handoff_summon(
+        self,
+        query: str,
+        *,
+        timeout: float = 60.0,
+        context_pack: dict | None = None,
+    ) -> dict:
+        """Run a fresh agent turn for a bot-to-bot summon request.
+
+        The summon path is intentionally lighter-weight than the regular
+        gateway chat endpoints: it starts a brand-new turn with no prior
+        conversation history, lets the agent reason with its normal toolset,
+        and returns plaintext plus light usage metrics.
+        """
+        started_at = time.time()
+        from hermes_tools.handoff import HandoffError as _HE
+
+        prompt = query
+        if isinstance(context_pack, dict) and context_pack:
+            from hermes_tools.cowork_context_pack import render_context_pack_markdown
+
+            context_md = render_context_pack_markdown(context_pack).strip()
+            prompt = (
+                "Structured cowork context pack:\n\n"
+                f"{context_md}\n\n"
+                "---\n\n"
+                f"{query.strip()}"
+            )
+
+        try:
+            result, usage = await asyncio.wait_for(
+                self._run_agent(
+                    user_message=prompt,
+                    conversation_history=[],
+                    session_id=f"handoff_summon_{uuid.uuid4().hex}",
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise _HE(
+                f"Summon request timed out after {timeout}s",
+                status=504,
+            )
+
+        if not isinstance(result, dict):
+            raise _HE(
+                f"Summon request returned invalid result: {type(result).__name__}",
+                status=500,
+            )
+
+        if result.get("failed"):
+            error_msg = result.get("error") or "summon request failed"
+            raise _HE(str(error_msg), status=500)
+
+        final_response = result.get("final_response")
+        if final_response is None:
+            error_msg = result.get("error") or "summon request produced no answer"
+            raise _HE(str(error_msg), status=500)
+
+        metrics = dict(usage or {})
+        metrics.setdefault("api_calls", result.get("api_calls", 0))
+        metrics.setdefault("completed", bool(result.get("completed")))
+        metrics["elapsed_ms"] = round((time.time() - started_at) * 1000, 1)
+
+        return {
+            "success": True,
+            "result": str(final_response),
+            "metrics": metrics,
+        }
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — list hermes-agent and any configured model_routes aliases.
 
@@ -2892,6 +3555,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
+                "status": {"method": "GET", "path": "/api/status"},
                 "models": {"method": "GET", "path": "/v1/models"},
                 "model_options": {"method": "GET", "path": "/api/model/options"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},

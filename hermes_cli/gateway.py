@@ -1408,29 +1408,160 @@ def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
         print("  can refuse to start another copy until this process stops.")
 
 
+_FLEET_STATUS_PROFILES = ("pt", "code", "life", "mgmt")
+_FLEET_STATUS_PORTS = {"pt": 8653, "code": 8654, "life": 8655, "mgmt": 8656}
+_FLEET_STATUS_LABELS = {"pt": "PT", "code": "Code", "life": "Life", "mgmt": "Mgmt"}
+
+
 def _print_other_profiles_gateway_status() -> None:
-    """Print a summary of gateway status across all profiles.
+    """Print a compact fleet summary from every gateway's /api/status endpoint.
 
-    Shown at the bottom of ``hermes gateway status`` output so users with
-    multiple profiles can tell at a glance which gateways are running and
-    avoid confusing another profile's process with the current one.
+    The status command stays useful when one gateway is down because each
+    endpoint is queried independently with a short timeout. Healthy bots are
+    rendered on one compact line plus a second detail line; degraded bots add a
+    visible error line so Telegram readers can spot the failure quickly.
     """
+    import json as _json
+    import urllib.error as _urlerror
+    import urllib.request as _urlrequest
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _shorten(value: object, *, width: int) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return textwrap.shorten(text, width=width, placeholder="…")
+
+    def _humanize_count(value: object) -> str:
+        try:
+            num = int(value)
+        except Exception:
+            return ""
+        if num >= 1_000_000:
+            return f"{num / 1_000_000:.1f}M".rstrip("0").rstrip(".")
+        if num >= 1_000:
+            return f"{num / 1_000:.1f}k".rstrip("0").rstrip(".")
+        return str(num)
+
+    def _summarize_task(payload: dict) -> str:
+        task = payload.get("task")
+        if not isinstance(task, dict):
+            task = payload.get("task_summary")
+        if not isinstance(task, dict):
+            task = {
+                "id": payload.get("task_id"),
+                "status": payload.get("task_status") or payload.get("state"),
+                "title": payload.get("task_title"),
+            }
+        task_id = str(task.get("id") or task.get("task_id") or "").strip()
+        task_status = str(task.get("status") or task.get("state") or "").strip()
+        title = _shorten(task.get("title") or task.get("name") or "", width=36)
+        if not any([task_id, task_status, title]):
+            return "task=idle"
+        parts = []
+        if task_id:
+            parts.append(task_id)
+        if task_status:
+            parts.append(task_status)
+        if title:
+            parts.append(f'"{title}"')
+        return "task=" + " ".join(parts)
+
+    def _fetch_status(profile: str) -> dict:
+        port = _FLEET_STATUS_PORTS[profile]
+        url = f"http://127.0.0.1:{port}/api/status"
+        req = _urlrequest.Request(url, headers={"Accept": "application/json"})
+        try:
+            with _urlrequest.urlopen(req, timeout=1.5) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+                data = _json.loads(raw) if raw else {}
+                if not isinstance(data, dict):
+                    raise ValueError("status payload was not an object")
+                data.setdefault("profile", profile)
+                data["_request_ok"] = True
+                return data
+        except _urlerror.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", "replace").strip()
+            except Exception:
+                body = ""
+            error = f"HTTP {exc.code} {exc.reason}".strip()
+            if body:
+                error = f"{error}: {_shorten(body, width=120)}"
+            return {"profile": profile, "_request_ok": False, "last_error": error}
+        except Exception as exc:
+            return {"profile": profile, "_request_ok": False, "last_error": f"{type(exc).__name__}: {exc}"}
+
+    def _status_is_healthy(payload: dict) -> bool:
+        if not payload.get("_request_ok", True):
+            return False
+        provider_ok = payload.get("provider_ok")
+        if provider_ok is not None:
+            return bool(provider_ok)
+        state = str(
+            payload.get("gateway_state")
+            or payload.get("state")
+            or payload.get("status")
+            or ""
+        ).strip().lower()
+        return state in {"running", "connected", "healthy", "ok"}
+
+    def _format_line(payload: dict) -> tuple[str, str | None]:
+        profile = str(payload.get("profile") or "").strip() or "unknown"
+        label = _FLEET_STATUS_LABELS.get(profile, profile.title())
+        healthy = _status_is_healthy(payload)
+        badge = "🟢" if healthy else "🔴"
+        state = str(
+            payload.get("gateway_state")
+            or payload.get("state")
+            or payload.get("status")
+            or ("running" if healthy else "degraded")
+        ).strip() or ("running" if healthy else "degraded")
+        model = _shorten(payload.get("model") or payload.get("model_name") or "", width=26)
+        task_summary = _summarize_task(payload)
+        pid = payload.get("pid")
+        pid_part = f"pid {pid}" if pid not in (None, "") else ""
+        mem_used = _humanize_count(payload.get("memory_used_chars"))
+        mem_limit = _humanize_count(payload.get("memory_limit_chars"))
+        mem_part = f"mem {mem_used}/{mem_limit}" if mem_used and mem_limit else ""
+        toolsets = payload.get("toolsets") or []
+        if isinstance(toolsets, (list, tuple, set)):
+            tool_list = [str(t).strip() for t in toolsets if str(t).strip()]
+            tool_part = f"tools={_shorten(','.join(tool_list[:4]), width=42)}" if tool_list else ""
+        else:
+            tool_part = _shorten(toolsets, width=42)
+            tool_part = f"tools={tool_part}" if tool_part else ""
+
+        detail_bits = [bit for bit in (mem_part, pid_part, tool_part) if bit]
+        line = f"{badge} {label} — {state}"
+        if model:
+            line += f" · model={model}"
+        line += f" · {task_summary}"
+
+        if healthy:
+            detail = " · ".join(detail_bits) if detail_bits else None
+        else:
+            last_error = payload.get("last_error") or payload.get("error")
+            if not last_error and not payload.get("_request_ok", True):
+                last_error = "status endpoint unreachable"
+            detail = f"last_error: {_shorten(last_error or 'unknown error', width=120)}"
+            if detail_bits:
+                detail += f" · {' · '.join(detail_bits)}"
+        return line, detail
+
     try:
-        from hermes_cli.profiles import get_active_profile_name
-
-        current = get_active_profile_name()
-        other_processes = [
-            p for p in find_profile_gateway_processes() if p.profile != current
-        ]
-        if not other_processes:
-            return
-
-        print()
-        print("Other profiles:")
-        for proc in other_processes:
-            print(f"  ✓ {proc.profile:<16s} — PID {proc.pid}")
+        with ThreadPoolExecutor(max_workers=len(_FLEET_STATUS_PROFILES)) as pool:
+            payloads = list(pool.map(_fetch_status, _FLEET_STATUS_PROFILES))
     except Exception:
-        pass
+        return
+
+    print()
+    print("Fleet status:")
+    for payload in payloads:
+        line, detail = _format_line(payload)
+        print(f"  {line}")
+        if detail:
+            print(f"    {detail}")
 
 
 def _gateway_list() -> None:

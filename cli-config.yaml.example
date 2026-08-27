@@ -666,6 +666,9 @@ memory:
   
   # User profile: preferences, communication style, expectations
   user_profile_enabled: true
+
+  # Fleet memory: shared cross-bot facts
+  fleet_dir: /opt/hermes/profiles/shared/memory
   
   # Character limits (~2.75 chars per token, model-independent)
   memory_char_limit: 2200   # ~800 tokens

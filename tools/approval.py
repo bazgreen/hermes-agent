@@ -23,8 +23,8 @@ import time
 import unicodedata
 from typing import Optional
 from hermes_cli.config import cfg_get
-
 from tools.interrupt import is_interrupted
+from tools.delegation_audit import record_delegation_audit
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -40,14 +40,6 @@ _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 # legacy single-threaded callers, but prefer the context-local value when set.
 _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
-    default="",
-)
-_approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "approval_turn_id",
-    default="",
-)
-_approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "approval_tool_call_id",
     default="",
 )
 
@@ -110,8 +102,6 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
         # (e.g. bare tool-only imports, minimal test environments).
         return
     try:
-        kwargs.setdefault("turn_id", _approval_turn_id.get())
-        kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
         invoke_hook(hook_name, **kwargs)
     except Exception as exc:
         # invoke_hook() already swallows per-callback errors, so reaching here
@@ -178,27 +168,6 @@ def reset_current_session_key(token: contextvars.Token[str]) -> None:
     _approval_session_key.reset(token)
 
 
-def set_current_observability_context(
-    *,
-    turn_id: str = "",
-    tool_call_id: str = "",
-) -> tuple[contextvars.Token[str], contextvars.Token[str]]:
-    """Bind active tool correlation IDs to approval hooks."""
-    return (
-        _approval_turn_id.set(turn_id or ""),
-        _approval_tool_call_id.set(tool_call_id or ""),
-    )
-
-
-def reset_current_observability_context(
-    tokens: tuple[contextvars.Token[str], contextvars.Token[str]],
-) -> None:
-    """Restore prior approval hook correlation IDs."""
-    turn_token, tool_token = tokens
-    _approval_tool_call_id.reset(tool_token)
-    _approval_turn_id.reset(turn_token)
-
-
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 
@@ -206,12 +175,40 @@ def get_current_session_key(default: str = "default") -> str:
     1. approval-specific contextvars (set by gateway before agent.run)
     2. session_context contextvars (set by _set_session_env)
     3. os.environ fallback (CLI, cron, tests)
+
+    If a stale approval contextvar leaks across tests, prefer the live
+    gateway session key from process env when it has registered approval state.
     """
     session_key = _approval_session_key.get()
     if session_key:
+        try:
+            process_gateway_session = os.getenv("HERMES_SESSION_KEY", "")
+            if env_var_enabled("HERMES_GATEWAY_SESSION") and process_gateway_session and process_gateway_session != session_key:
+                with _lock:
+                    if (
+                        process_gateway_session in _gateway_notify_cbs
+                        or process_gateway_session in _gateway_queues
+                        or process_gateway_session in _session_approved
+                        or process_gateway_session in _session_trusted
+                    ):
+                        return process_gateway_session
+            from gateway.session_context import get_session_env
+
+            context_gateway_session = get_session_env("HERMES_SESSION_KEY", "")
+            if context_gateway_session and context_gateway_session != session_key:
+                with _lock:
+                    if (
+                        context_gateway_session in _gateway_notify_cbs
+                        or context_gateway_session in _gateway_queues
+                        or context_gateway_session in _session_approved
+                        or context_gateway_session in _session_trusted
+                    ):
+                        return context_gateway_session
+        except Exception:
+            pass
         return session_key
     from gateway.session_context import get_session_env
-    return get_session_env("HERMES_SESSION_KEY", default)
+    return get_session_env("HERMES_SESSION_KEY", default) or os.getenv("HERMES_SESSION_KEY", default)
 
 
 def _get_session_platform() -> str:
@@ -259,14 +256,6 @@ _HERMES_ENV_PATH = (
     r'(?:\$hermes_home|\$\{hermes_home\})/)'
     r'\.env\b'
 )
-# ~/.hermes/config.yaml IS the security policy: approvals.mode, yolo, and the
-# permanent-approval allowlist live here, and the config cache is mtime-keyed
-# so a write takes effect mid-session (the agent could flip approvals.mode=off
-# and immediately bypass the gate). Pair the write_file/patch deny (file_tools
-# _check_sensitive_path) with terminal-side coverage so `sed -i`, `tee`, `>`,
-# `cp`, etc. targeting it are gated too — otherwise the deny is unpaired
-# theater. Mirrors _HERMES_ENV_PATH; matches the HERMES_HOME override form as
-# well as ~/.hermes/.
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|'
     r'(?:\$home|\$\{home\})/\.hermes/|'
@@ -782,9 +771,9 @@ DANGEROUS_PATTERNS = [
     # tee, and copy/move/install coverage. Gate the same user-controlled
     # startup/credential files so `sed -i ... ~/.bashrc` and `perl -i ...
     # ~/.ssh/authorized_keys` cannot silently plant login commands or keys.
-    (rf'\bsed\s+-[^\s]*i.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),
-    (rf'\bsed\s+--in-place\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (long flag)"),
-    (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (perl/ruby)"),
+    (rf'\bsed\s+-[^\s]*i.*(?:{_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),
+    (rf'\bsed\s+--in-place\b.*(?:{_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (long flag)"),
+    (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (perl/ruby)"),
     (rf'\bsed\s+-[^\s]*i.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config"),
     (rf'\bsed\s+--in-place\b.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config (long flag)"),
     # In-place edit of a Hermes-managed security file (~/.hermes/config.yaml or
@@ -804,6 +793,9 @@ DANGEROUS_PATTERNS = [
     (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (perl/ruby)"),
     # Interpreter heredocs are handled by _execution_flag_findings() alongside
     # inline-exec flags; keep only shell heredocs regex-based here.
+    # Script execution via heredoc — bypasses the -e/-c flag patterns above.
+    # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
+    (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
     # Shell execution via heredoc — `bash <<'EOF' ... EOF` runs arbitrary
     # shell commands without triggering the `bash -c` pattern above. The
     # inner commands may not individually match any dangerous pattern (e.g.
@@ -907,6 +899,18 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
     historical regex-derived key.
     """
     return _PATTERN_KEY_ALIASES.get(pattern_key, {pattern_key})
+
+
+def _execute_code_approval_key(code: str) -> str:
+    """Return the stable approval key for an execute_code script.
+
+    The key is content-addressed so an explicitly approved exact script can
+    be recognized again after retries or gateway restarts without broadening
+    approval to unrelated code.
+    """
+    normalized = code.replace("\r\n", "\n").strip()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    return f"execute_code:{digest}"
 
 
 # =========================================================================
@@ -2065,6 +2069,7 @@ def detect_dangerous_command(command: str) -> tuple:
 _lock = threading.Lock()
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
+_session_trusted: set[str] = set()
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
@@ -2228,6 +2233,22 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if reason:
             entry.reason = reason
         entry.event.set()
+
+    audit_action = "allow" if choice in {"once", "session", "always"} else ("deny" if choice == "deny" else "review_required")
+    try:
+        record_delegation_audit(
+            action=audit_action,
+            caller_profile=os.getenv("HERMES_PROFILE", "worker"),
+            callee_profile=session_key or os.getenv("HERMES_SESSION_PLATFORM", "approval-gateway"),
+            parameters={"choice": choice, "resolve_all": resolve_all, "targets": len(targets)},
+            correlation_id=session_key,
+            session_id=get_current_session_key(default=""),
+            reason="gateway approval resolved",
+            source="approval_gateway",
+        )
+    except Exception:
+        logger.debug("Delegation audit helper failed for gateway approval", exc_info=True)
+
     return len(targets)
 
 
@@ -2269,6 +2290,20 @@ def _release_permission_mode_dependents(session_key: str) -> None:
         )
 
 
+def trust_session(session_key: str) -> None:
+    """Trust the whole current gateway session for approval purposes.
+
+    This is intentionally broader than a single pattern approval: it is used
+    when a user clicks "always" in a gateway-driven workflow and wants the
+    rest of that orchestration run to stop re-prompting on equivalent low-risk
+    commands / scripts. Hardline blocks still apply.
+    """
+    if not session_key:
+        return
+    with _lock:
+        _session_trusted.add(session_key)
+
+
 def enable_session_yolo(session_key: str) -> None:
     """Enable YOLO bypass for a single session key."""
     if not session_key:
@@ -2293,6 +2328,7 @@ def clear_session(session_key: str) -> None:
         return
     with _lock:
         _session_approved.pop(session_key, None)
+        _session_trusted.discard(session_key)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
@@ -2318,13 +2354,15 @@ def is_current_session_yolo_enabled() -> bool:
 
 
 def is_approved(session_key: str, pattern_key: str) -> bool:
-    """Check if a pattern is approved (session-scoped or permanent).
+    """Check if a pattern is approved (session-scoped, trusted, or permanent).
 
-    Accept both the current canonical key and the legacy regex-derived key so
+    Accepts any alias of the pattern_key so historical key migrations and
     existing command_allowlist entries continue to work after key migrations.
     """
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
+        if session_key in _session_trusted:
+            return True
         if any(alias in _permanent_approved for alias in aliases):
             return True
         session_approvals = _session_approved.get(session_key, set())
@@ -3734,6 +3772,8 @@ def check_all_command_guards(command: str, env_type: str,
             # A human approval (including an ESCALATE-then-approve or a
             # smart-DENY owner override) resets the consecutive-denial tally.
             _reset_denials(session_key)
+            if choice == "always" and any(not is_tirith for _, _, is_tirith in warnings):
+                trust_session(session_key)
             return {"approved": True, "message": None,
                     "user_approved": True, "description": combined_desc}
 
@@ -3830,6 +3870,8 @@ def check_all_command_guards(command: str, env_type: str,
 
     # A human approval resets the consecutive-denial tally.
     _reset_denials(session_key)
+    if choice == "always" and any(not is_tirith for _, _, is_tirith in warnings):
+        trust_session(session_key)
     return {"approved": True, "message": None,
             "user_approved": True, "description": combined_desc}
 
@@ -3857,7 +3899,7 @@ def check_execute_code_guard(code: str, env_type: str,
     description = (
         "execute_code script execution. The script can spawn subprocesses or "
         "mutate files without passing through terminal command approval; "
-        "approval is one-shot for this run."
+        "approval is exact-script scoped to the current session or permanent allowlist."
     )
 
     # Isolated backends already sandbox the child — matches the container skip
@@ -3897,7 +3939,7 @@ def check_execute_code_guard(code: str, env_type: str,
             }
         return {"approved": True, "message": None}
 
-    # Only gateway/ask contexts get the one-shot whole-script approval.
+    # Only gateway/ask contexts get exact-script approval.
     #   * CLI interactive: the script's terminal() calls are guarded per-call
     #     (context now propagates into the RPC thread, #33057); a whole-script
     #     prompt would fire on every execute_code call.
@@ -3906,15 +3948,23 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
+    approval_key = _execute_code_approval_key(code)
     # Built only now (past the early-return gates) so the common non-approval
     # paths don't pay to copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"
 
+
     # Check session/permanent approval — same gate as check_all_command_guards.
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts the user (#39275).
-    if is_approved(session_key, pattern_key):
-        return {"approved": True, "message": None}
+    if is_approved(session_key, approval_key):
+        return {
+            "approved": True,
+            "message": None,
+            "user_approved": True,
+            "description": description,
+            "approval_key": approval_key,
+        }
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()
@@ -3932,10 +3982,13 @@ def check_execute_code_guard(code: str, env_type: str,
         _observe_smart_approval_verdict(observer_payload, verdict)
         if verdict == "approve":
             _reset_denials(session_key)
+            approve_session(session_key, approval_key)
+            _reset_denials(session_key)
             logger.debug("Smart approval: auto-approved execute_code for session %s",
                          session_key)
             return {"approved": True, "message": None,
-                    "smart_approved": True, "description": description}
+                    "smart_approved": True, "description": description,
+                    "approval_key": approval_key}
         if verdict == "deny" and not (is_gateway or is_ask):
             _record_denial(session_key)
             breaker_addendum = _denial_breaker_addendum(session_key)
@@ -4052,22 +4105,23 @@ def check_execute_code_guard(code: str, env_type: str,
             "deny_reason": deny_reason,
         }
 
-    # Never persist a smart-DENY override under the coarse execute_code key;
-    # doing so would approve unrelated future scripts. Manual and ESCALATE
-    # decisions preserve their existing session/permanent behavior.
+    # Approved — exact-script approvals persist only for the matching code
+    # fingerprint. This keeps repeated retries / restarts from re-prompting
+    # while still requiring a fresh decision for modified code. Smart-DENY owner
+    # overrides remain one-operation scoped and are not persisted.
     if not smart_denied_for_owner:
-        if choice == "session":
-            approve_session(session_key, pattern_key)
-        elif choice == "always":
-            approve_session(session_key, pattern_key)
-            approve_permanent(pattern_key)
+        if choice == "session" or choice == "always":
+            approve_session(session_key, approval_key)
+        if choice == "always":
+            approve_permanent(approval_key)
             save_permanent_allowlist(_permanent_approved)
-    # choice == "once": no persistence — approval lasts this single call only.
+            trust_session(session_key)
 
     # A human approval resets the consecutive-denial tally.
     _reset_denials(session_key)
     return {"approved": True, "message": None,
-            "user_approved": True, "description": description}
+            "user_approved": True, "description": description,
+            "approval_key": approval_key}
 
 
 # =========================================================================

@@ -215,6 +215,69 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         conn2.close()
 
 
+def _mock_goal_judge(monkeypatch, verdict, reason, parse_failed, wait_directive, transport_failed):
+    """Point kanban_tools.judge_goal at a scripted 5-tuple and force the
+    availability probe True so the goal-mode gate actually runs."""
+    monkeypatch.setattr(
+        "tools.kanban_tools.judge_goal",
+        lambda **kw: (verdict, reason, parse_failed, wait_directive, transport_failed),
+    )
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+
+def test_complete_goal_mode_transport_failed_allows_completion(monkeypatch, tmp_path):
+    """A judge transport failure must fail OPEN: log and complete, never wedge."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    _mock_goal_judge(
+        monkeypatch,
+        verdict="continue",
+        reason="judge error: mock",
+        parse_failed=False,
+        wait_directive=None,
+        transport_failed=True,
+    )
+
+    out = kt._handle_complete({"summary": "did the work, transport failed"})
+    d = json.loads(out)
+    assert d.get("ok") is True, f"expected completion, got: {out}"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "done"
+    finally:
+        conn.close()
+
+
+def test_complete_goal_mode_transport_ok_continue_rejected(monkeypatch, tmp_path):
+    """With transport fine and verdict != done, completion must still reject."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    _mock_goal_judge(
+        monkeypatch,
+        verdict="continue",
+        reason="not done",
+        parse_failed=False,
+        wait_directive=None,
+        transport_failed=False,
+    )
+
+    out = kt._handle_complete({"summary": "partial work"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "Goal completion rejected by judge" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})

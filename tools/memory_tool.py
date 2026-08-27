@@ -62,9 +62,15 @@ def get_memory_dir() -> Path:
 MEMORY_BLOCK_HEADERS = {
     "memory": "MEMORY (your personal notes)",
     "user": "USER PROFILE (who the user is)",
+    "fleet": "FLEET MEMORY (shared across bots)",
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+# Document ID prefix/suffix used for stable upsert-by-key memory writes.
+# An entry with a document_id is stored as: "[doc:<id>] <content>"
+DOC_ID_PREFIX = "[doc:"
+DOC_ID_SUFFIX = "] "
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +155,11 @@ class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
 
-    Maintains two parallel states:
+    Maintains three parallel states:
       - _system_prompt_snapshot: frozen at load time, used for system prompt injection.
         Never mutated mid-session. Keeps prefix cache stable.
-      - memory_entries / user_entries: live state, mutated by tool calls, persisted to disk.
-        Tool responses always reflect this live state.
+      - memory_entries / user_entries / fleet_entries: live state, mutated by tool calls,
+        persisted to disk. Tool responses always reflect this live state.
     """
 
     # After this many failed consolidation attempts (overflow / zero-match) in
@@ -162,13 +168,16 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, fleet_dir: Optional[str] = None):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
+        self.fleet_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.fleet_char_limit = memory_char_limit
+        self.fleet_dir = Path(fleet_dir).expanduser() if fleet_dir else None
         # Frozen snapshot for system prompt -- set once at load_from_disk()
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": "", "fleet": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
@@ -201,7 +210,7 @@ class MemoryStore:
         }
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
+        """Load entries from MEMORY.md, USER.md, and optional FLEET.md, capture system prompt snapshot.
 
         The frozen snapshot is what enters the system prompt. We scan each
         entry for injection/promptware patterns at snapshot-build time —
@@ -210,9 +219,10 @@ class MemoryStore:
         chain, compromised tool, sister-session write) cannot inject into
         the system prompt.
 
-        The live ``memory_entries`` / ``user_entries`` lists keep the
-        original text so the user can still SEE poisoned entries via
-        see poisoned entries by inspecting the source files directly, and remove them — silently dropping them would hide the attack from the user.
+        The live ``memory_entries`` / ``user_entries`` / ``fleet_entries``
+        lists keep the original text so the user can still SEE poisoned
+        entries in memory tool responses and remove them — silently
+        dropping them would hide the attack from the user.
 
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
@@ -222,21 +232,29 @@ class MemoryStore:
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
+        if self.fleet_dir is not None:
+            self.fleet_dir.mkdir(parents=True, exist_ok=True)
+            self.fleet_entries = self._read_file(self.fleet_dir / "FLEET.md")
+        else:
+            self.fleet_entries = []
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
+        self.fleet_entries = list(dict.fromkeys(self.fleet_entries))
 
         # Sanitize entries for the system-prompt snapshot only.  Live state
-        # (memory_entries / user_entries) keeps the raw text so the user
+        # (memory_entries / user_entries / fleet_entries) keeps the raw text so the user
         # can see + remove poisoned entries via the memory tool.
         sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
         sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
+        sanitized_fleet = self._sanitize_entries_for_snapshot(self.fleet_entries, "FLEET.md")
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
+            "fleet": self._render_block("fleet", sanitized_fleet),
         }
 
     @staticmethod
@@ -276,6 +294,29 @@ class MemoryStore:
         return sanitized
 
     @staticmethod
+    def _format_doc_entry(document_id: str, content: str) -> str:
+        """Wrap content with document_id prefix for stable upsert lookup."""
+        return f"{DOC_ID_PREFIX}{document_id}{DOC_ID_SUFFIX}{content}"
+
+    @staticmethod
+    def _doc_id_from_entry(entry: str) -> Optional[str]:
+        """Extract the document_id from an entry, or None if it has none."""
+        if entry.startswith(DOC_ID_PREFIX):
+            suffix_start = entry.find(DOC_ID_SUFFIX, len(DOC_ID_PREFIX))
+            if suffix_start != -1:
+                return entry[len(DOC_ID_PREFIX):suffix_start]
+        return None
+
+    @staticmethod
+    def _find_by_document_id(entries: List[str], document_id: str) -> Optional[int]:
+        """Find the index of an entry with the given document_id, or None."""
+        needle = f"{DOC_ID_PREFIX}{document_id}{DOC_ID_SUFFIX}"
+        for i, entry in enumerate(entries):
+            if entry.startswith(needle):
+                return i
+        return None
+
+    @staticmethod
     @contextmanager
     def _file_lock(path: Path):
         """Acquire an exclusive file lock for read-modify-write safety.
@@ -312,11 +353,14 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
+    def _path_for(self, target: str) -> Path:
         mem_dir = get_memory_dir()
         if target == "user":
             return mem_dir / "USER.md"
+        if target == "fleet":
+            if self.fleet_dir is None:
+                raise ValueError("Fleet memory directory is not configured.")
+            return self.fleet_dir / "FLEET.md"
         return mem_dir / "MEMORY.md"
 
     def _reload_target(self, target: str, *, skip_drift: bool = False):
@@ -368,11 +412,15 @@ class MemoryStore:
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
             return self.user_entries
+        if target == "fleet":
+            return self.fleet_entries
         return self.memory_entries
 
     def _set_entries(self, target: str, entries: List[str]):
         if target == "user":
             self.user_entries = entries
+        elif target == "fleet":
+            self.fleet_entries = entries
         else:
             self.memory_entries = entries
 
@@ -385,10 +433,18 @@ class MemoryStore:
     def _char_limit(self, target: str) -> int:
         if target == "user":
             return self.user_char_limit
+        if target == "fleet":
+            return self.fleet_char_limit
         return self.memory_char_limit
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
-        """Append a new entry. Returns error if it would exceed the char limit."""
+    def add(self, target: str, content: str, document_id: str = None) -> Dict[str, Any]:
+        """Append a new entry, or upsert by document_id if provided.
+
+        When document_id is supplied:
+          - If an entry with that document_id exists, it is replaced.
+          - If not, a new entry is created with the document_id marker.
+        When document_id is omitted, existing append-only behaviour is preserved.
+        """
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
@@ -417,14 +473,58 @@ class MemoryStore:
             entries = self._entries_for(target)
             limit = self._char_limit(target)
 
-            # Reject exact duplicates
+            if document_id:
+                # Upsert by document_id — use stable key prefix for lookup
+                stored = f"{DOC_ID_PREFIX}{document_id}{DOC_ID_SUFFIX}{content}"
+                idx = self._find_by_document_id(entries, document_id)
+                if idx is not None:
+                    # Replace existing entry
+                    test_entries = entries.copy()
+                    test_entries[idx] = stored
+                    new_total = len(ENTRY_DELIMITER.join(test_entries))
+                    if new_total > limit:
+                        current = self._char_count(target)
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Memory at {current:,}/{limit:,} chars. "
+                                f"Replacing entry with document_id='{document_id}' "
+                                f"({len(stored)} chars) would exceed the limit."
+                            ),
+                            "current_entries": entries,
+                            "usage": f"{current:,}/{limit:,}",
+                        }
+                    entries[idx] = stored
+                    self._set_entries(target, entries)
+                    self.save_to_disk(target)
+                    return self._success_response(target, f"Entry replaced (document_id='{document_id}').")
+
+                # Document_id is new — check limit and append
+                new_entries = entries + [stored]
+                new_total = len(ENTRY_DELIMITER.join(new_entries))
+                if new_total > limit:
+                    current = self._char_count(target)
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Memory at {current:,}/{limit:,} chars. "
+                            f"Adding this entry ({len(stored)} chars) would exceed the limit. "
+                            f"Replace or remove existing entries first."
+                        ),
+                        "current_entries": entries,
+                        "usage": f"{current:,}/{limit:,}",
+                    }
+                entries.append(stored)
+                self._set_entries(target, entries)
+                self.save_to_disk(target)
+                return self._success_response(target, f"Entry added (document_id='{document_id}').")
+
+            # No document_id — classic append with duplicate check
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
 
-            # Calculate what the new total would be
             new_entries = entries + [content]
             new_total = len(ENTRY_DELIMITER.join(new_entries))
-
             if new_total > limit:
                 current = self._char_count(target)
                 return self._consolidation_failure({
@@ -517,11 +617,19 @@ class MemoryStore:
 
         return self._success_response(target, "Entry replaced.")
 
-    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
-        """Remove the entry containing old_text substring."""
-        old_text = old_text.strip()
-        if not old_text:
-            return {"success": False, "error": "old_text cannot be empty."}
+    def remove(self, target: str, old_text: str = None, document_id: str = None) -> Dict[str, Any]:
+        """Remove an entry by old_text substring or by document_id.
+
+        Either old_text or document_id must be provided. When document_id is
+        supplied, the entry with that stable key is removed directly without
+        fragile substring matching.
+        """
+        if not old_text and not document_id:
+            return {"success": False, "error": "Either 'old_text' or 'document_id' is required."}
+        if old_text:
+            old_text = old_text.strip()
+        if not old_text and not document_id:
+            return {"success": False, "error": "Either 'old_text' or 'document_id' is required."}
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
@@ -531,6 +639,20 @@ class MemoryStore:
                 return _drift_error(self._path_for(target), bak)
 
             entries = self._entries_for(target)
+
+            if document_id:
+                idx = self._find_by_document_id(entries, document_id)
+                if idx is None:
+                    return {"success": False, "error": f"No entry matched document_id='{document_id}'."}
+                removed = entries.pop(idx)
+                self._set_entries(target, entries)
+                self.save_to_disk(target)
+                doc_label = self._doc_id_from_entry(removed)
+                return self._success_response(target, f"Entry removed (document_id='{doc_label}').")
+
+            # Fallback to old_text substring matching
+            if not old_text:
+                return {"success": False, "error": "old_text cannot be empty."}
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
 
             if not matches:
@@ -740,6 +862,8 @@ class MemoryStore:
 
         if target == "user":
             header = f"{MEMORY_BLOCK_HEADERS['user']} [{pct}% — {current:,}/{limit:,} chars]"
+        elif target == "fleet":
+            header = f"{MEMORY_BLOCK_HEADERS['fleet']} [{pct}% — {current:,}/{limit:,} chars]"
         else:
             header = f"{MEMORY_BLOCK_HEADERS['memory']} [{pct}% — {current:,}/{limit:,} chars]"
 
@@ -1050,6 +1174,7 @@ def memory_tool(
     content: str = None,
     old_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
+    document_id: str = None,
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -1060,19 +1185,24 @@ def memory_tool(
       - Batch:     operations=[{action, content?, old_text?}, ...] applied
                    atomically against the final char budget in ONE call.
 
+    Also accepts an optional ``document_id`` for stable upsert-on-add and
+    targeted remove — avoids fragile ``old_text`` substring matching.
+
     Returns JSON string with results.
     """
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
     # Some strict providers fill optional schema fields with JSON null rather
-    # than omitting them.  Treat ``target: null`` as omitted so memory writes
+    # than omitting them. Treat ``target: null`` as omitted so memory writes
     # still use the documented default store instead of failing validation.
     if target is None:
         target = "memory"
 
-    if target not in {"memory", "user"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if target not in {"memory", "user", "fleet"}:
+        return tool_error(f"Invalid target '{target}'. Use 'memory', 'user', or 'fleet'.", success=False)
+    if target == "fleet" and getattr(store, "fleet_dir", None) is None:
+        return tool_error("Fleet memory is not available in this agent configuration.", success=False)
 
     # --- Batch path -------------------------------------------------------
     if operations:
@@ -1089,16 +1219,14 @@ def memory_tool(
     # immediately instead of being staged and only failing at approve time.
     if action == "add" and not content:
         return tool_error("Content is required for 'add' action.", success=False)
-    if action == "replace" and (not old_text or not content):
-        missing = "old_text" if not old_text else "content"
-        if not old_text:
+    if action == "replace" and (not content or (not old_text and not document_id)):
+        if not old_text and not document_id:
             # The client/model omitted old_text. Replace is inherently targeted
             # -- we can't guess which entry. Return the current inventory plus a
-            # retry instruction so the model can reissue with old_text set,
-            # instead of hitting a dead-end error. (issues #43412, #49466)
+            # retry instruction so the model can reissue with old_text set.
             return _missing_old_text_error(store, target, "replace")
-        return tool_error(f"{missing} is required for 'replace' action.", success=False)
-    if action == "remove" and not old_text:
+        return tool_error("content is required for 'replace' action.", success=False)
+    if action == "remove" and not old_text and not document_id:
         return _missing_old_text_error(store, target, "remove")
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
@@ -1108,13 +1236,28 @@ def memory_tool(
         return gate_result
 
     if action == "add":
-        result = store.add(target, content)
+        if not content:
+            return tool_error("Content is required for 'add' action.", success=False)
+        result = store.add(target, content, document_id=document_id)
 
     elif action == "replace":
-        result = store.replace(target, old_text, content)
+        if not old_text and not document_id:
+            return tool_error("Either 'old_text' or 'document_id' is required for 'replace' action.", success=False)
+        if not content:
+            return tool_error("content is required for 'replace' action.", success=False)
+        if document_id:
+            # When document_id is provided, find the entry by doc ID first,
+            # then delegate to the normal replace flow with the matched entry.
+            entries = store._entries_for(target)
+            idx = store._find_by_document_id(entries, document_id)
+            if idx is None:
+                return json.dumps({"success": False, "error": f"No entry matched document_id='{document_id}'."})
+            result = store.replace(target, entries[idx], content)
+        else:
+            result = store.replace(target, old_text, content)
 
     elif action == "remove":
-        result = store.remove(target, old_text)
+        result = store.remove(target, old_text=old_text, document_id=document_id)
 
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
@@ -1139,12 +1282,19 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     old_text = payload.get("old_text") or ""
     if action == "batch":
         return store.apply_batch(target, payload.get("operations") or [])
+    document_id = payload.get("document_id")
     if action == "add":
-        return store.add(target, content)
+        return store.add(target, content, document_id=document_id)
     if action == "replace":
+        if document_id:
+            entries = store._entries_for(target)
+            idx = store._find_by_document_id(entries, document_id)
+            if idx is None:
+                return {"success": False, "error": f"No entry matched document_id='{document_id}'."}
+            return store.replace(target, entries[idx], content)
         return store.replace(target, old_text, content)
     if action == "remove":
-        return store.remove(target, old_text)
+        return store.remove(target, old_text, document_id=document_id)
     return {"success": False, "error": f"Unknown staged action '{action}'."}
 # OpenAI Function-Calling Schema
 # =============================================================================
@@ -1160,7 +1310,8 @@ MEMORY_SCHEMA = {
         "to free room AND add new ones, even when an add alone would overflow. The response "
         "reports current/limit chars and confirms completion; one batch call finishes the "
         "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
-        "single lone change.\n\n"
+        "single lone change. When available, pass `document_id` for stable upsert-on-add "
+        "instead of fragile `old_text` substring matching.\n\n"
         "WHEN: save proactively when the user states a preference, correction, or personal "
         "detail, or you learn a stable fact about their environment, conventions, or workflow. "
         "Priority: user preferences & corrections > environment facts > procedures. The best "
@@ -1168,7 +1319,9 @@ MEMORY_SCHEMA = {
         "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
         "removes or shortens enough stale entries and adds the new one together.\n\n"
         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
-        "notes (environment, conventions, tool quirks, lessons).\n\n"
+        "notes (environment, conventions, tool quirks, lessons). 'fleet' = shared "
+        "cross-bot notes (sprint goals, infrastructure state, calendar events, user "
+        "preferences).\n\n"
         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
         "completed-work logs, temporary TODO state (use session_search for those). Reusable "
         "procedures belong in a skill, not memory."
@@ -1183,8 +1336,8 @@ MEMORY_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "enum": ["memory", "user", "fleet"],
+                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile, 'fleet' for cross-bot shared notes."
             },
             "content": {
                 "type": "string",
@@ -1211,6 +1364,10 @@ MEMORY_SCHEMA = {
                     "required": ["action"],
                 },
             },
+            "document_id": {
+                "type": "string",
+                "description": "Stable semantic key for upsert-by-ID. Pass with action='add' to create-or-replace. Also supported on action='remove' and action='replace' to avoid fragile old_text matching."
+            },
         },
         "required": ["target"],
     },
@@ -1230,6 +1387,7 @@ registry.register(
         content=args.get("content"),
         old_text=args.get("old_text"),
         operations=args.get("operations"),
+        document_id=args.get("document_id"),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",
